@@ -1,0 +1,2343 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Jan 26 11:04:40 2026
+
+@author: brcum
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Beyond Price and Time - ETF & Liquid Stocks Edition
+Copyright © 2026 Truth Communications LLC. All Rights Reserved.
+
+Real-time trading signals with stasis detection
+Merit Score: Multi-timeframe stasis confluence indicator
+"""
+
+import time
+import threading
+import numpy as np
+from typing import List, Dict, Tuple, Optional
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from collections import deque, defaultdict
+import webbrowser
+from enum import Enum
+import copy
+import json
+import os
+
+import dash
+from dash import dcc, html, Input, Output, State, callback_context, dash_table, ALL, MATCH
+import dash_bootstrap_components as dbc
+import pandas as pd
+
+import websocket
+import ssl
+import requests
+
+# ============================================================================
+# API KEY
+# ============================================================================
+
+POLYGON_API_KEY = "PnzhJOXEJO7tSpHr0ct2zjFKi6XO0yGi"
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+@dataclass
+class Config:
+    # ETFs (19) + Top 100 Most Liquid Stocks = 119 symbols
+    symbols: List[str] = field(default_factory=lambda: [
+        # ==================== ETFs (19) ====================
+        # Major Index ETFs
+        "SPY", "QQQ", "IWM", "DIA",
+        # Sector ETFs
+        "XLF", "XLE", "XLU", "XLK", "XLP", "XLB", "XLV", "XLI", "XLY", "XLC", "XLRE",
+        # Thematic ETFs
+        "KRE", "SMH", "XBI", "GDX",
+        
+        # ==================== TOP 100 LIQUID STOCKS ====================
+        # Mega Cap Tech
+        "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "AVGO", "ORCL", "ADBE",
+        # Tech continued
+        "CRM", "AMD", "INTC", "CSCO", "QCOM", "IBM", "NOW", "INTU", "AMAT", "MU",
+        "NFLX", "PYPL", "SHOP", "SQ", "UBER", "ABNB", "COIN", "SNAP", "ROKU", "PLTR",
+        # Finance
+        "JPM", "BAC", "WFC", "GS", "MS", "C", "BLK", "SCHW", "AXP", "V",
+        "MA", "COF", "USB", "PNC", "TFC",
+        # Healthcare
+        "UNH", "JNJ", "LLY", "PFE", "ABBV", "MRK", "TMO", "ABT", "DHR", "BMY",
+        "AMGN", "GILD", "VRTX", "REGN", "MRNA",
+        # Consumer
+        "WMT", "HD", "COST", "TGT", "LOW", "NKE", "SBUX", "MCD", "DIS", "CMCSA",
+        # Industrial & Energy
+        "CAT", "BA", "GE", "HON", "UNP", "RTX", "LMT", "DE", "UPS", "FDX",
+        "XOM", "CVX", "COP", "SLB", "EOG",
+        # Other High Volume
+        "T", "VZ", "TMUS", "PG", "KO", "PEP", "PM", "MO", "CL", "MMM",
+        "F", "GM", "RIVN", "LCID", "NIO",
+    ])
+    
+    # ETF symbols for identification
+    etf_symbols: List[str] = field(default_factory=lambda: [
+        "SPY", "QQQ", "IWM", "DIA",
+        "XLF", "XLE", "XLU", "XLK", "XLP", "XLB", "XLV", "XLI", "XLY", "XLC", "XLRE",
+        "KRE", "SMH", "XBI", "GDX",
+    ])
+    
+    # Your specified thresholds
+    thresholds: List[float] = field(default_factory=lambda: [
+        0.000625, 0.00125, 0.0025, 0.005, 0.01, 0.02, 0.03, 0.04, 0.05, 0.10
+    ])
+    
+    display_bits: int = 20
+    update_interval_ms: int = 500
+    cache_refresh_interval: float = 0.25
+    history_days: int = 5
+    
+    polygon_api_key: str = POLYGON_API_KEY
+    polygon_ws_url: str = "wss://socket.polygon.io/stocks"
+    polygon_rest_url: str = "https://api.polygon.io"
+    
+    volumes: Dict[str, float] = field(default_factory=dict)
+    week52_data: Dict[str, Dict] = field(default_factory=dict)
+    
+    min_tradable_stasis: int = 3
+    
+    # Price alerts file
+    alerts_file: str = "price_alerts.json"
+
+config = Config()
+# Remove duplicates while preserving order
+config.symbols = list(dict.fromkeys(config.symbols))
+
+# ============================================================================
+# ENUMS
+# ============================================================================
+
+class Direction(Enum):
+    LONG = "LONG"
+    SHORT = "SHORT"
+
+class SignalStrength(Enum):
+    WEAK = "WEAK"
+    MODERATE = "MODERATE"
+    STRONG = "STRONG"
+    VERY_STRONG = "VERY_STRONG"
+
+class AlertType(Enum):
+    ABOVE = "ABOVE"
+    BELOW = "BELOW"
+    CROSS = "CROSS"  # Triggers on any cross of the price
+
+class AlertStatus(Enum):
+    ACTIVE = "ACTIVE"
+    TRIGGERED = "TRIGGERED"
+    EXPIRED = "EXPIRED"
+
+# ============================================================================
+# PRICE ALERT SYSTEM
+# ============================================================================
+
+@dataclass
+class PriceAlert:
+    id: str
+    symbol: str
+    target_price: float
+    alert_type: str  # "ABOVE", "BELOW", "CROSS"
+    created_at: datetime
+    status: str = "ACTIVE"
+    triggered_at: Optional[datetime] = None
+    triggered_price: Optional[float] = None
+    note: str = ""
+    last_price: Optional[float] = None
+    
+    def to_dict(self) -> Dict:
+        return {
+            'id': self.id,
+            'symbol': self.symbol,
+            'target_price': self.target_price,
+            'alert_type': self.alert_type,
+            'created_at': self.created_at.isoformat(),
+            'status': self.status,
+            'triggered_at': self.triggered_at.isoformat() if self.triggered_at else None,
+            'triggered_price': self.triggered_price,
+            'note': self.note,
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'PriceAlert':
+        return cls(
+            id=data['id'],
+            symbol=data['symbol'],
+            target_price=data['target_price'],
+            alert_type=data['alert_type'],
+            created_at=datetime.fromisoformat(data['created_at']),
+            status=data.get('status', 'ACTIVE'),
+            triggered_at=datetime.fromisoformat(data['triggered_at']) if data.get('triggered_at') else None,
+            triggered_price=data.get('triggered_price'),
+            note=data.get('note', ''),
+        )
+
+
+class PriceAlertManager:
+    def __init__(self):
+        self.alerts: Dict[str, PriceAlert] = {}
+        self.triggered_alerts: List[PriceAlert] = []
+        self.lock = threading.Lock()
+        self.alert_counter = 0
+        self.new_triggers: List[Dict] = []  # For UI notifications
+        self.load_alerts()
+    
+    def generate_id(self) -> str:
+        self.alert_counter += 1
+        return f"ALERT_{datetime.now().strftime('%Y%m%d%H%M%S')}_{self.alert_counter}"
+    
+    def add_alert(self, symbol: str, target_price: float, alert_type: str, note: str = "") -> PriceAlert:
+        with self.lock:
+            alert_id = self.generate_id()
+            alert = PriceAlert(
+                id=alert_id,
+                symbol=symbol.upper(),
+                target_price=target_price,
+                alert_type=alert_type.upper(),
+                created_at=datetime.now(),
+                note=note
+            )
+            self.alerts[alert_id] = alert
+            self.save_alerts()
+            print(f"🔔 Alert created: {symbol} {alert_type} ${target_price:.2f}")
+            return alert
+    
+    def remove_alert(self, alert_id: str) -> bool:
+        with self.lock:
+            if alert_id in self.alerts:
+                del self.alerts[alert_id]
+                self.save_alerts()
+                return True
+            return False
+    
+    def clear_triggered(self) -> int:
+        with self.lock:
+            count = len([a for a in self.alerts.values() if a.status == "TRIGGERED"])
+            self.alerts = {k: v for k, v in self.alerts.items() if v.status != "TRIGGERED"}
+            self.save_alerts()
+            return count
+    
+    def check_alerts(self, prices: Dict[str, float]):
+        """Check all active alerts against current prices"""
+        with self.lock:
+            for alert_id, alert in list(self.alerts.items()):
+                if alert.status != "ACTIVE":
+                    continue
+                
+                current_price = prices.get(alert.symbol)
+                if current_price is None:
+                    continue
+                
+                triggered = False
+                
+                if alert.alert_type == "ABOVE":
+                    if current_price >= alert.target_price:
+                        triggered = True
+                elif alert.alert_type == "BELOW":
+                    if current_price <= alert.target_price:
+                        triggered = True
+                elif alert.alert_type == "CROSS":
+                    # Check if price crossed the target
+                    if alert.last_price is not None:
+                        if (alert.last_price < alert.target_price <= current_price or
+                            alert.last_price > alert.target_price >= current_price):
+                            triggered = True
+                
+                alert.last_price = current_price
+                
+                if triggered:
+                    alert.status = "TRIGGERED"
+                    alert.triggered_at = datetime.now()
+                    alert.triggered_price = current_price
+                    self.triggered_alerts.append(alert)
+                    self.new_triggers.append({
+                        'id': alert.id,
+                        'symbol': alert.symbol,
+                        'target_price': alert.target_price,
+                        'triggered_price': current_price,
+                        'alert_type': alert.alert_type,
+                        'note': alert.note,
+                        'time': datetime.now().strftime("%H:%M:%S")
+                    })
+                    print(f"🚨 ALERT TRIGGERED: {alert.symbol} hit ${current_price:.2f} (target: ${alert.target_price:.2f} {alert.alert_type})")
+                    self.save_alerts()
+    
+    def get_new_triggers(self) -> List[Dict]:
+        """Get and clear new triggers for UI notification"""
+        with self.lock:
+            triggers = self.new_triggers.copy()
+            self.new_triggers.clear()
+            return triggers
+    
+    def get_active_alerts(self) -> List[Dict]:
+        with self.lock:
+            active = [a for a in self.alerts.values() if a.status == "ACTIVE"]
+            return [a.to_dict() for a in sorted(active, key=lambda x: x.symbol)]
+    
+    def get_triggered_alerts(self) -> List[Dict]:
+        with self.lock:
+            triggered = [a for a in self.alerts.values() if a.status == "TRIGGERED"]
+            return [a.to_dict() for a in sorted(triggered, key=lambda x: x.triggered_at or x.created_at, reverse=True)]
+    
+    def get_all_alerts(self) -> List[Dict]:
+        with self.lock:
+            return [a.to_dict() for a in self.alerts.values()]
+    
+    def save_alerts(self):
+        try:
+            data = [a.to_dict() for a in self.alerts.values()]
+            with open(config.alerts_file, 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            print(f"Error saving alerts: {e}")
+    
+    def load_alerts(self):
+        try:
+            if os.path.exists(config.alerts_file):
+                with open(config.alerts_file, 'r') as f:
+                    data = json.load(f)
+                    for item in data:
+                        alert = PriceAlert.from_dict(item)
+                        self.alerts[alert.id] = alert
+                print(f"📂 Loaded {len(self.alerts)} alerts from file")
+        except Exception as e:
+            print(f"Error loading alerts: {e}")
+    
+    def get_alerts_for_symbol(self, symbol: str) -> List[Dict]:
+        with self.lock:
+            return [a.to_dict() for a in self.alerts.values() 
+                    if a.symbol == symbol.upper() and a.status == "ACTIVE"]
+    
+    def get_stats(self) -> Dict:
+        with self.lock:
+            active = sum(1 for a in self.alerts.values() if a.status == "ACTIVE")
+            triggered = sum(1 for a in self.alerts.values() if a.status == "TRIGGERED")
+            symbols = len(set(a.symbol for a in self.alerts.values() if a.status == "ACTIVE"))
+            return {
+                'active': active,
+                'triggered': triggered,
+                'symbols': symbols
+            }
+
+# Initialize alert manager
+alert_manager = PriceAlertManager()
+
+# ============================================================================
+# DATA FETCHERS
+# ============================================================================
+
+def fetch_52_week_data() -> Dict[str, Dict]:
+    print("📊 Fetching 52-week high/low data...")
+    week52_data = {}
+    
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=365)
+    
+    for i, symbol in enumerate(config.symbols):
+        try:
+            url = (
+                f"{config.polygon_rest_url}/v2/aggs/ticker/{symbol}/range/1/day/"
+                f"{start_date.strftime('%Y-%m-%d')}/{end_date.strftime('%Y-%m-%d')}"
+                f"?adjusted=true&sort=asc&limit=365&apiKey={config.polygon_api_key}"
+            )
+            
+            response = requests.get(url, timeout=15)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('results') and len(data['results']) > 0:
+                    highs = [bar['h'] for bar in data['results']]
+                    lows = [bar['l'] for bar in data['results']]
+                    high_val = max(highs)
+                    low_val = min(lows)
+                    week52_data[symbol] = {
+                        'high': high_val,
+                        'low': low_val,
+                        'range': high_val - low_val,
+                    }
+                else:
+                    week52_data[symbol] = {'high': None, 'low': None, 'range': None}
+            else:
+                week52_data[symbol] = {'high': None, 'low': None, 'range': None}
+            
+            if (i + 1) % 20 == 0:
+                print(f"   📈 Processed {i + 1}/{len(config.symbols)}...")
+            
+            time.sleep(0.12)
+        except Exception as e:
+            week52_data[symbol] = {'high': None, 'low': None, 'range': None}
+    
+    print(f"✅ 52-week data loaded for {len(week52_data)} symbols\n")
+    return week52_data
+
+def fetch_volume_data() -> Dict[str, float]:
+    print("📊 Fetching volume data...")
+    volumes = {}
+    
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=45)
+    
+    for i, symbol in enumerate(config.symbols):
+        try:
+            url = (
+                f"{config.polygon_rest_url}/v2/aggs/ticker/{symbol}/range/1/day/"
+                f"{start_date.strftime('%Y-%m-%d')}/{end_date.strftime('%Y-%m-%d')}"
+                f"?adjusted=true&sort=desc&limit=30&apiKey={config.polygon_api_key}"
+            )
+            
+            response = requests.get(url, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('results') and len(data['results']) > 0:
+                    total_volume = sum(bar['v'] for bar in data['results'])
+                    volumes[symbol] = (total_volume / len(data['results'])) / 1_000_000
+                else:
+                    volumes[symbol] = 50.0
+            else:
+                volumes[symbol] = 50.0
+            
+            if (i + 1) % 20 == 0:
+                print(f"   📈 Processed {i + 1}/{len(config.symbols)}...")
+            
+            time.sleep(0.12)
+        except:
+            volumes[symbol] = 50.0
+    
+    print(f"✅ Volume data loaded for {len(volumes)} symbols\n")
+    return volumes
+
+def fetch_historical_bars(symbol: str, days: int = 5) -> List[Dict]:
+    bars = []
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=days)
+    
+    try:
+        url = (
+            f"{config.polygon_rest_url}/v2/aggs/ticker/{symbol}/range/1/minute/"
+            f"{start_date.strftime('%Y-%m-%d')}/{end_date.strftime('%Y-%m-%d')}"
+            f"?adjusted=true&sort=asc&limit=50000&apiKey={config.polygon_api_key}"
+        )
+        
+        response = requests.get(url, timeout=30)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('results'):
+                for bar in data['results']:
+                    bars.append({
+                        'timestamp': datetime.fromtimestamp(bar['t'] / 1000),
+                        'close': bar['c'],
+                    })
+    except:
+        pass
+    
+    return bars
+
+def calculate_52week_percentile(price: float, symbol: str) -> Optional[float]:
+    if symbol not in config.week52_data:
+        return None
+    data = config.week52_data[symbol]
+    if data is None:
+        return None
+    high = data.get('high')
+    low = data.get('low')
+    range_val = data.get('range')
+    if high is None or low is None or range_val is None or range_val <= 0:
+        return None
+    percentile = ((price - low) / range_val) * 100
+    return max(0.0, min(100.0, percentile))
+
+def is_etf(symbol: str) -> bool:
+    return symbol in config.etf_symbols
+
+# ============================================================================
+# STASIS INFO
+# ============================================================================
+
+@dataclass
+class StasisInfo:
+    start_time: datetime
+    start_price: float
+    peak_stasis: int = 1
+    
+    def get_duration(self) -> timedelta:
+        return datetime.now() - self.start_time
+    
+    def get_duration_str(self) -> str:
+        duration = self.get_duration()
+        total_seconds = int(duration.total_seconds())
+        if total_seconds < 60:
+            return f"{total_seconds}s"
+        elif total_seconds < 3600:
+            return f"{total_seconds // 60}m {total_seconds % 60}s"
+        else:
+            return f"{total_seconds // 3600}h {(total_seconds % 3600) // 60}m"
+    
+    def get_start_date_str(self) -> str:
+        return self.start_time.strftime("%m/%d %H:%M")
+    
+    def get_price_change_pct(self, current_price: float) -> float:
+        if self.start_price == 0:
+            return 0.0
+        return (current_price - self.start_price) / self.start_price * 100
+
+# ============================================================================
+# BITSTREAM
+# ============================================================================
+
+@dataclass
+class BitEntry:
+    bit: int
+    price: float
+    timestamp: datetime
+
+class Bitstream:
+    def __init__(self, symbol: str, threshold: float, initial_price: float, volume: float):
+        self.symbol = symbol
+        self.threshold = threshold
+        self.initial_price = initial_price
+        self.volume = volume
+        self.is_etf = is_etf(symbol)
+        
+        self.reference_price = initial_price
+        self.current_live_price = initial_price
+        self.last_price_update = datetime.now()
+        
+        self._update_bands()
+        
+        self.bits: deque = deque(maxlen=500)
+        
+        self.current_stasis = 0
+        self.last_bit = None
+        self.direction = None
+        self.signal_strength = None
+        
+        self.stasis_info: Optional[StasisInfo] = None
+        
+        self.total_bits = 0
+        self._lock = threading.Lock()
+    
+    def _update_bands(self):
+        self.band_width = self.threshold * self.reference_price
+        self.upper_band = self.reference_price + self.band_width
+        self.lower_band = self.reference_price - self.band_width
+    
+    def process_price(self, price: float, timestamp: datetime) -> List[int]:
+        with self._lock:
+            self.current_live_price = price
+            self.last_price_update = timestamp
+            
+            generated_bits = []
+            
+            if self.lower_band < price < self.upper_band:
+                return generated_bits
+            
+            if self.band_width <= 0:
+                return generated_bits
+            
+            x = int((price - self.reference_price) / self.band_width)
+            
+            if x > 0:
+                for _ in range(x):
+                    self.bits.append(BitEntry(1, price, timestamp))
+                    generated_bits.append(1)
+                    self.total_bits += 1
+                self.reference_price = price
+                self._update_bands()
+            elif x < 0:
+                for _ in range(abs(x)):
+                    self.bits.append(BitEntry(0, price, timestamp))
+                    generated_bits.append(0)
+                    self.total_bits += 1
+                self.reference_price = price
+                self._update_bands()
+            
+            if generated_bits:
+                self._update_stasis(timestamp)
+            
+            return generated_bits
+    
+    def _update_stasis(self, timestamp: datetime):
+        if len(self.bits) < 2:
+            self.current_stasis = len(self.bits)
+            self.last_bit = self.bits[-1].bit if self.bits else None
+            self.direction = None
+            self.signal_strength = None
+            return
+        
+        bits_list = list(self.bits)
+        
+        stasis_count = 1
+        stasis_start_idx = len(bits_list) - 1
+        
+        for i in range(len(bits_list) - 1, 0, -1):
+            if bits_list[i].bit != bits_list[i-1].bit:
+                stasis_count += 1
+                stasis_start_idx = i - 1
+            else:
+                break
+        
+        prev_stasis = self.current_stasis
+        self.current_stasis = stasis_count
+        self.last_bit = bits_list[-1].bit
+        
+        if prev_stasis < 2 and stasis_count >= 2:
+            if 0 <= stasis_start_idx < len(bits_list):
+                first_bit = bits_list[stasis_start_idx]
+                self.stasis_info = StasisInfo(
+                    start_time=first_bit.timestamp,
+                    start_price=first_bit.price,
+                    peak_stasis=stasis_count,
+                )
+        elif stasis_count >= 2 and self.stasis_info is not None:
+            if stasis_count > self.stasis_info.peak_stasis:
+                self.stasis_info.peak_stasis = stasis_count
+        elif prev_stasis >= 2 and stasis_count < 2:
+            self.stasis_info = None
+        
+        if self.current_stasis >= 2:
+            self.direction = Direction.LONG if self.last_bit == 1 else Direction.SHORT
+            if self.current_stasis >= 10:
+                self.signal_strength = SignalStrength.VERY_STRONG
+            elif self.current_stasis >= 7:
+                self.signal_strength = SignalStrength.STRONG
+            elif self.current_stasis >= 5:
+                self.signal_strength = SignalStrength.MODERATE
+            elif self.current_stasis >= 3:
+                self.signal_strength = SignalStrength.WEAK
+            else:
+                self.signal_strength = None
+        else:
+            self.direction = None
+            self.signal_strength = None
+    
+    def is_tradable(self) -> bool:
+        with self._lock:
+            return (
+                self.current_stasis >= config.min_tradable_stasis and
+                self.direction is not None and
+                self.volume > 1.0
+            )
+    
+    def get_snapshot(self, live_price: Optional[float] = None) -> Dict:
+        with self._lock:
+            current_price = live_price if live_price is not None else self.current_live_price
+            
+            anchor_price = None
+            stasis_start_str = "—"
+            stasis_duration_str = "—"
+            duration_seconds = 0
+            stasis_price_change_pct = None
+            
+            if self.stasis_info is not None:
+                anchor_price = self.stasis_info.start_price
+                stasis_start_str = self.stasis_info.get_start_date_str()
+                stasis_duration_str = self.stasis_info.get_duration_str()
+                duration_seconds = self.stasis_info.get_duration().total_seconds()
+                stasis_price_change_pct = self.stasis_info.get_price_change_pct(current_price)
+            
+            take_profit = None
+            stop_loss = None
+            risk_reward = None
+            distance_to_tp_pct = None
+            distance_to_sl_pct = None
+            
+            if self.direction is not None and self.current_stasis >= 2:
+                if self.direction == Direction.LONG:
+                    take_profit = self.upper_band
+                    stop_loss = self.lower_band
+                    reward = take_profit - current_price
+                    risk = current_price - stop_loss
+                else:
+                    take_profit = self.lower_band
+                    stop_loss = self.upper_band
+                    reward = current_price - take_profit
+                    risk = stop_loss - current_price
+                
+                if risk > 0 and reward > 0:
+                    risk_reward = reward / risk
+                elif risk > 0 and reward <= 0:
+                    risk_reward = 0.0
+                else:
+                    risk_reward = None
+                
+                if current_price > 0:
+                    distance_to_tp_pct = (abs(take_profit - current_price) / current_price) * 100
+                    distance_to_sl_pct = (abs(stop_loss - current_price) / current_price) * 100
+            
+            week52_percentile = calculate_52week_percentile(current_price, self.symbol)
+            recent_bits = [b.bit for b in list(self.bits)[-15:]]
+            
+            return {
+                'symbol': self.symbol,
+                'is_etf': self.is_etf,
+                'threshold': self.threshold,
+                'threshold_pct': self.threshold * 100,
+                'stasis': self.current_stasis,
+                'total_bits': self.total_bits,
+                'recent_bits': recent_bits,
+                'current_price': current_price,
+                'anchor_price': anchor_price,
+                'direction': self.direction.value if self.direction else None,
+                'signal_strength': self.signal_strength.value if self.signal_strength else None,
+                'is_tradable': (
+                    self.current_stasis >= config.min_tradable_stasis and
+                    self.direction is not None and
+                    self.volume > 1.0
+                ),
+                'stasis_start_str': stasis_start_str,
+                'stasis_duration_str': stasis_duration_str,
+                'duration_seconds': duration_seconds,
+                'stasis_price_change_pct': stasis_price_change_pct,
+                'take_profit': take_profit,
+                'stop_loss': stop_loss,
+                'risk_reward': risk_reward,
+                'distance_to_tp_pct': distance_to_tp_pct,
+                'distance_to_sl_pct': distance_to_sl_pct,
+                'week52_percentile': week52_percentile,
+                'volume': self.volume,
+            }
+
+# ============================================================================
+# PRICE FEED - REAL-TIME
+# ============================================================================
+
+class PolygonPriceFeed:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.current_prices: Dict[str, float] = {}
+        self.is_running = False
+        self.ws = None
+        self.ws_thread = None
+        self.message_count = 0
+        self.last_update_time: Dict[str, datetime] = {}
+        
+        for symbol in config.symbols:
+            self.current_prices[symbol] = None
+    
+    def start(self):
+        self.is_running = True
+        self.ws_thread = threading.Thread(target=self._ws_loop, daemon=True)
+        self.ws_thread.start()
+        print("✅ Real-time WebSocket starting...")
+        return True
+    
+    def stop(self):
+        self.is_running = False
+        if self.ws:
+            self.ws.close()
+    
+    def _ws_loop(self):
+        while self.is_running:
+            try:
+                self._connect()
+            except Exception as e:
+                print(f"❌ WebSocket error: {e}")
+                if self.is_running:
+                    time.sleep(5)
+    
+    def _connect(self):
+        def on_message(ws, message):
+            try:
+                data = json.loads(message)
+                if isinstance(data, list):
+                    for msg in data:
+                        self._process(msg)
+                else:
+                    self._process(data)
+            except:
+                pass
+        
+        def on_open(ws):
+            print("✅ Real-time WebSocket connected!")
+            ws.send(json.dumps({"action": "auth", "params": config.polygon_api_key}))
+        
+        def on_close(ws, code, msg):
+            print(f"WebSocket closed: {code}")
+        
+        def on_error(ws, error):
+            print(f"WebSocket error: {error}")
+        
+        self.ws = websocket.WebSocketApp(
+            config.polygon_ws_url,
+            on_open=on_open,
+            on_message=on_message,
+            on_close=on_close,
+            on_error=on_error
+        )
+        self.ws.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE})
+    
+    def _process(self, msg: Dict):
+        if msg.get('ev') == 'status':
+            status = msg.get('status')
+            print(f"📊 Status: {status} - {msg.get('message', '')}")
+            if status == 'auth_success':
+                self._subscribe()
+        elif msg.get('ev') in ['A', 'AM', 'T', 'Q']:
+            symbol = msg.get('sym', '') or msg.get('S', '')
+            price = msg.get('c') or msg.get('vw') or msg.get('p') or msg.get('bp')
+            if price and symbol in config.symbols:
+                with self.lock:
+                    self.current_prices[symbol] = float(price)
+                    self.last_update_time[symbol] = datetime.now()
+                    self.message_count += 1
+    
+    def _subscribe(self):
+        if self.ws:
+            # Subscribe in batches
+            for i in range(0, len(config.symbols), 50):
+                batch = config.symbols[i:i+50]
+                symbols_str = ",".join([f"A.{s}" for s in batch])
+                self.ws.send(json.dumps({
+                    "action": "subscribe",
+                    "params": symbols_str
+                }))
+                time.sleep(0.1)
+            print(f"📡 Subscribed to {len(config.symbols)} symbols (REAL-TIME)")
+    
+    def get_all_prices(self) -> Dict[str, float]:
+        with self.lock:
+            return {k: v for k, v in self.current_prices.items() if v is not None}
+    
+    def get_status(self) -> Dict:
+        with self.lock:
+            connected = sum(1 for v in self.current_prices.values() if v is not None)
+            return {
+                'total': len(config.symbols),
+                'connected': connected,
+                'message_count': self.message_count
+            }
+
+price_feed = PolygonPriceFeed()
+
+# ============================================================================
+# BITSTREAM MANAGER
+# ============================================================================
+
+class BitstreamManager:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.streams: Dict[Tuple[str, float], Bitstream] = {}
+        self.is_running = False
+        
+        self.cached_data: List[Dict] = []
+        self.cached_merit_scores: Dict[str, Dict] = {}
+        self.cache_lock = threading.Lock()
+        
+        self.initialized = False
+        self.backfill_complete = False
+        self.backfill_progress = 0
+    
+    def backfill(self):
+        print("\n" + "=" * 60)
+        print("📜 BACKFILLING HISTORICAL DATA")
+        print("=" * 60)
+        
+        historical_data = {}
+        
+        for i, symbol in enumerate(config.symbols):
+            bars = fetch_historical_bars(symbol, config.history_days)
+            if bars:
+                historical_data[symbol] = bars
+            
+            self.backfill_progress = int((i + 1) / len(config.symbols) * 100)
+            
+            if (i + 1) % 20 == 0:
+                print(f"   📊 {i + 1}/{len(config.symbols)} ({self.backfill_progress}%)")
+            
+            time.sleep(0.12)
+        
+        print(f"\n✅ Historical data: {len(historical_data)} symbols")
+        
+        with self.lock:
+            for symbol, bars in historical_data.items():
+                if not bars:
+                    continue
+                
+                initial_price = bars[0]['close']
+                volume = config.volumes.get(symbol, 50.0)
+                
+                for threshold in config.thresholds:
+                    key = (symbol, threshold)
+                    self.streams[key] = Bitstream(symbol, threshold, initial_price, volume)
+                    
+                    for bar in bars:
+                        self.streams[key].process_price(bar['close'], bar['timestamp'])
+        
+        self.initialized = True
+        self.backfill_complete = True
+        
+        tradable = sum(1 for s in self.streams.values() if s.is_tradable())
+        print(f"✅ Bitstreams: {len(self.streams)} | Tradable: {tradable}")
+        print("=" * 60 + "\n")
+    
+    def start(self):
+        self.is_running = True
+        threading.Thread(target=self._process_loop, daemon=True).start()
+        threading.Thread(target=self._cache_loop, daemon=True).start()
+        threading.Thread(target=self._alert_check_loop, daemon=True).start()
+    
+    def _process_loop(self):
+        while self.is_running:
+            time.sleep(0.05)
+            if not self.backfill_complete:
+                continue
+            
+            prices = price_feed.get_all_prices()
+            timestamp = datetime.now()
+            
+            with self.lock:
+                for symbol, price in prices.items():
+                    for threshold in config.thresholds:
+                        key = (symbol, threshold)
+                        if key in self.streams:
+                            self.streams[key].process_price(price, timestamp)
+    
+    def _alert_check_loop(self):
+        """Separate thread to check price alerts"""
+        while self.is_running:
+            time.sleep(0.5)  # Check alerts every 500ms
+            if not self.backfill_complete:
+                continue
+            
+            prices = price_feed.get_all_prices()
+            if prices:
+                alert_manager.check_alerts(prices)
+                
+    def _cache_loop(self):
+        """Background thread that refreshes cached data for the UI"""
+        while self.is_running:
+            time.sleep(config.cache_refresh_interval)
+            if not self.initialized:
+                continue
+            
+            live_prices = price_feed.get_all_prices()
+            snapshots = []
+            
+            with self.lock:
+                for stream in self.streams.values():
+                    live_price = live_prices.get(stream.symbol)
+                    snapshots.append(stream.get_snapshot(live_price))
+            
+            merit_scores = self._calculate_merit_scores(snapshots)
+            
+            with self.cache_lock:
+                self.cached_data = snapshots
+                self.cached_merit_scores = merit_scores
+    
+    def _calculate_merit_scores(self, snapshots: List[Dict]) -> Dict[str, Dict]:
+        """
+        Merit Score Logic:
+        
+        The merit score should reflect CONFIDENCE in a trade direction.
+        
+        Key Principles:
+        1. Higher thresholds = larger price movements = MORE significant signal
+        2. Aligned stasis levels multiply each other's significance
+        3. Conflicting stasis levels cancel each other out
+        4. A single strong stasis at high threshold > multiple weak at low thresholds
+        5. Perfect alignment across many levels = exceptional opportunity
+        
+        Threshold Weighting:
+        - 0.0625% threshold = minor noise, low weight
+        - 1% threshold = moderate significance
+        - 5-10% threshold = major price level, high weight
+        """
+        
+        # Define threshold weights - higher thresholds get exponentially more weight
+        # These are the actual threshold values from config
+        THRESHOLD_WEIGHTS = {
+            0.000625: 1.0,    # 0.0625% - baseline (noise level)
+            0.00125:  1.5,    # 0.125%
+            0.0025:   2.0,    # 0.25%
+            0.005:    3.0,    # 0.5%
+            0.01:     5.0,    # 1% - significant
+            0.02:     8.0,    # 2%
+            0.03:     12.0,   # 3%
+            0.04:     16.0,   # 4%
+            0.05:     20.0,   # 5% - major
+            0.10:     30.0,   # 10% - extreme, very rare
+        }
+        
+        def get_threshold_weight(threshold: float) -> float:
+            """Get weight for a threshold, with interpolation for unknown values"""
+            if threshold in THRESHOLD_WEIGHTS:
+                return THRESHOLD_WEIGHTS[threshold]
+            # Interpolate or extrapolate based on threshold value
+            # Higher threshold = more weight (roughly logarithmic scale)
+            return max(1.0, threshold * 200)  # Fallback formula
+        
+        def calculate_level_weight(stasis: int, threshold: float) -> float:
+            """
+            Calculate the weight of a single stasis level.
+            Combines stasis strength with threshold significance.
+            
+            Weight = (stasis ^ 1.3) * threshold_weight
+            
+            Examples:
+            - Stasis 5 at 0.0625%: (5^1.3) * 1.0 = 8.1
+            - Stasis 5 at 1%:      (5^1.3) * 5.0 = 40.5
+            - Stasis 5 at 5%:      (5^1.3) * 20.0 = 162.0
+            - Stasis 10 at 5%:     (10^1.3) * 20.0 = 399.0
+            """
+            stasis_factor = stasis ** 1.3  # Moderate exponential for stasis
+            threshold_factor = get_threshold_weight(threshold)
+            return stasis_factor * threshold_factor
+        
+        merit_data = defaultdict(lambda: {
+            'stasis_levels': 0,
+            'total_stasis': 0,
+            'weighted_score': 0,
+            'directions': [],
+            'dominant_direction': None,
+            'direction_alignment': 0,
+            'conflict_penalty': 0,
+            'alignment_bonus': 0,
+            'avg_stasis': 0,
+            'max_stasis': 0,
+            'max_threshold_in_stasis': 0,
+            'long_levels': 0,
+            'short_levels': 0,
+            'long_weight': 0,
+            'short_weight': 0,
+            'levels_detail': [],
+            'thresholds_in_stasis': [],
+            'net_direction': None,
+            'confidence': 0,
+            'highest_aligned_threshold': 0,
+        })
+        
+        # Group snapshots by symbol
+        symbol_snapshots = defaultdict(list)
+        for snap in snapshots:
+            symbol_snapshots[snap['symbol']].append(snap)
+        
+        for symbol, snaps in symbol_snapshots.items():
+            # Separate tradable levels by direction
+            long_levels = []
+            short_levels = []
+            all_stasis = []
+            all_thresholds_in_stasis = []
+            
+            for snap in snaps:
+                stasis = snap['stasis']
+                direction = snap['direction']
+                threshold = snap['threshold']
+                
+                all_stasis.append(stasis)
+                
+                if stasis >= config.min_tradable_stasis and direction:
+                    weight = calculate_level_weight(stasis, threshold)
+                    
+                    level_data = {
+                        'threshold': threshold,
+                        'threshold_pct': threshold * 100,
+                        'stasis': stasis,
+                        'direction': direction,
+                        'weight': weight,
+                        'threshold_weight': get_threshold_weight(threshold),
+                    }
+                    
+                    all_thresholds_in_stasis.append(threshold)
+                    
+                    if direction == 'LONG':
+                        long_levels.append(level_data)
+                    else:
+                        short_levels.append(level_data)
+            
+            # Calculate directional sums with full weights
+            long_weight = sum(level['weight'] for level in long_levels)
+            short_weight = sum(level['weight'] for level in short_levels)
+            long_stasis_sum = sum(level['stasis'] for level in long_levels)
+            short_stasis_sum = sum(level['stasis'] for level in short_levels)
+            
+            total_levels = len(long_levels) + len(short_levels)
+            total_weight = long_weight + short_weight
+            
+            # Track highest threshold in stasis for each direction
+            max_long_threshold = max([l['threshold'] for l in long_levels]) if long_levels else 0
+            max_short_threshold = max([l['threshold'] for l in short_levels]) if short_levels else 0
+            max_threshold_in_stasis = max(max_long_threshold, max_short_threshold)
+            
+            if total_levels == 0:
+                # No tradable levels
+                merit_data[symbol] = {
+                    'stasis_levels': 0,
+                    'total_stasis': sum(all_stasis),
+                    'weighted_score': 0,
+                    'directions': [],
+                    'dominant_direction': None,
+                    'direction_alignment': 0,
+                    'conflict_penalty': 0,
+                    'alignment_bonus': 0,
+                    'avg_stasis': 0,
+                    'max_stasis': max(all_stasis) if all_stasis else 0,
+                    'max_threshold_in_stasis': 0,
+                    'long_levels': 0,
+                    'short_levels': 0,
+                    'long_weight': 0,
+                    'short_weight': 0,
+                    'levels_detail': [],
+                    'thresholds_in_stasis': [],
+                    'net_direction': None,
+                    'confidence': 0,
+                    'highest_aligned_threshold': 0,
+                }
+                continue
+            
+            # Determine dominant direction and calculate NET directional strength
+            if long_weight > short_weight:
+                dominant_direction = 'LONG'
+                net_weight = long_weight - short_weight
+                aligned_levels = long_levels
+                opposing_levels = short_levels
+                aligned_weight = long_weight
+                opposing_weight = short_weight
+                highest_aligned_threshold = max_long_threshold
+            elif short_weight > long_weight:
+                dominant_direction = 'SHORT'
+                net_weight = short_weight - long_weight
+                aligned_levels = short_levels
+                opposing_levels = long_levels
+                aligned_weight = short_weight
+                opposing_weight = long_weight
+                highest_aligned_threshold = max_short_threshold
+            else:
+                # Perfect conflict - directions cancel out
+                dominant_direction = None
+                net_weight = 0
+                aligned_levels = []
+                opposing_levels = long_levels + short_levels
+                aligned_weight = 0
+                opposing_weight = total_weight
+                highest_aligned_threshold = 0
+            
+            # Calculate alignment percentage based on weights (not just counts)
+            if total_weight > 0:
+                alignment_pct = (max(long_weight, short_weight) / total_weight) * 100
+            else:
+                alignment_pct = 0
+            
+            # ================================================================
+            # MERIT SCORE CALCULATION
+            # ================================================================
+            
+            # Base score: Net directional weight (already incorporates threshold weights)
+            base_score = net_weight
+            
+            # ALIGNMENT BONUS: Reward alignment, especially at higher thresholds
+            num_aligned = len(aligned_levels)
+            num_opposing = len(opposing_levels)
+            
+            if alignment_pct == 100 and num_aligned >= 2:
+                # Perfect alignment - multiplicative bonus
+                # Bonus scales with number of aligned levels AND highest threshold
+                threshold_multiplier = 1 + (get_threshold_weight(highest_aligned_threshold) / 30)
+                alignment_bonus = base_score * (0.2 * (num_aligned - 1)) * threshold_multiplier
+                
+                # Extra bonus for many aligned levels
+                if num_aligned >= 3:
+                    alignment_bonus *= 1.3
+                if num_aligned >= 4:
+                    alignment_bonus *= 1.2
+                if num_aligned >= 5:
+                    alignment_bonus *= 1.2
+                    
+            elif alignment_pct >= 75:
+                # Strong alignment
+                alignment_bonus = base_score * (0.1 * (num_aligned - 1))
+            elif alignment_pct >= 60:
+                # Moderate alignment
+                alignment_bonus = base_score * 0.05
+            else:
+                alignment_bonus = 0
+            
+            # CONFLICT PENALTY: Punish conflicting signals
+            # Penalty weighted by the STRENGTH of opposing signals
+            if num_opposing > 0 and total_weight > 0:
+                conflict_ratio = opposing_weight / total_weight
+                
+                # Check if opposing signals include high-threshold levels (more serious conflict)
+                max_opposing_threshold = max([l['threshold'] for l in opposing_levels]) if opposing_levels else 0
+                high_threshold_conflict = max_opposing_threshold >= 0.01  # 1% or higher
+                
+                if conflict_ratio > 0.4:
+                    # Near 50/50 conflict - severe penalty
+                    conflict_penalty = base_score * 0.6
+                    if high_threshold_conflict:
+                        conflict_penalty *= 1.3  # Extra penalty for high-threshold conflicts
+                elif conflict_ratio > 0.25:
+                    # Significant conflict
+                    conflict_penalty = base_score * 0.35
+                    if high_threshold_conflict:
+                        conflict_penalty *= 1.2
+                elif conflict_ratio > 0.1:
+                    # Minor conflict
+                    conflict_penalty = base_score * 0.15
+                else:
+                    # Negligible conflict (weak opposing signal)
+                    conflict_penalty = base_score * 0.05
+            else:
+                conflict_penalty = 0
+            
+            # HIGH THRESHOLD BONUS: Extra reward for stasis at significant price levels
+            # This rewards catching major support/resistance levels
+            high_threshold_bonus = 0
+            for level in aligned_levels:
+                if level['threshold'] >= 0.05:  # 5% or higher
+                    high_threshold_bonus += level['weight'] * 0.25
+                elif level['threshold'] >= 0.02:  # 2% or higher
+                    high_threshold_bonus += level['weight'] * 0.1
+                elif level['threshold'] >= 0.01:  # 1% or higher
+                    high_threshold_bonus += level['weight'] * 0.05
+            
+            # STASIS DEPTH BONUS: Reward very high stasis counts
+            max_stasis = max(all_stasis) if all_stasis else 0
+            max_aligned_stasis = max([l['stasis'] for l in aligned_levels]) if aligned_levels else 0
+            
+            if max_aligned_stasis >= 10:
+                stasis_depth_bonus = base_score * 0.2
+            elif max_aligned_stasis >= 7:
+                stasis_depth_bonus = base_score * 0.1
+            elif max_aligned_stasis >= 5:
+                stasis_depth_bonus = base_score * 0.05
+            else:
+                stasis_depth_bonus = 0
+            
+            # FINAL WEIGHTED SCORE
+            weighted_score = (
+                base_score 
+                + alignment_bonus 
+                + high_threshold_bonus 
+                + stasis_depth_bonus 
+                - conflict_penalty
+            )
+            
+            # Ensure non-negative
+            weighted_score = max(0, weighted_score)
+            
+            # Calculate confidence score (0-100)
+            # Combines: alignment, stasis depth, and highest threshold
+            if dominant_direction and aligned_levels:
+                # Alignment component (0-40)
+                alignment_component = (alignment_pct / 100) * 40
+                
+                # Stasis component (0-30)
+                stasis_component = min(max_aligned_stasis / 10, 1.0) * 30
+                
+                # Threshold component (0-30) - higher thresholds = more confidence
+                threshold_component = min(get_threshold_weight(highest_aligned_threshold) / 20, 1.0) * 30
+                
+                confidence = alignment_component + stasis_component + threshold_component
+            else:
+                confidence = 0
+            
+            # Compile all levels for reference
+            all_directions = [l['direction'] for l in long_levels + short_levels]
+            all_levels = sorted(long_levels + short_levels, key=lambda x: x['threshold'], reverse=True)
+            
+            merit_data[symbol] = {
+                'stasis_levels': total_levels,
+                'total_stasis': sum(all_stasis),
+                'weighted_score': round(weighted_score, 1),
+                'directions': all_directions,
+                'dominant_direction': dominant_direction,
+                'direction_alignment': round(alignment_pct, 0),
+                'conflict_penalty': round(conflict_penalty, 1),
+                'alignment_bonus': round(alignment_bonus + high_threshold_bonus + stasis_depth_bonus, 1),
+                'avg_stasis': round((long_stasis_sum + short_stasis_sum) / total_levels, 1) if total_levels > 0 else 0,
+                'max_stasis': max_stasis,
+                'max_threshold_in_stasis': max_threshold_in_stasis,
+                'max_threshold_pct': max_threshold_in_stasis * 100,
+                'long_levels': len(long_levels),
+                'short_levels': len(short_levels),
+                'long_weight': round(long_weight, 1),
+                'short_weight': round(short_weight, 1),
+                'levels_detail': all_levels,
+                'thresholds_in_stasis': sorted(all_thresholds_in_stasis, reverse=True),
+                'net_direction': dominant_direction,
+                'confidence': round(confidence, 0),
+                'highest_aligned_threshold': highest_aligned_threshold,
+                'highest_aligned_threshold_pct': highest_aligned_threshold * 100,
+            }
+        
+        return dict(merit_data)
+    
+    def get_data(self) -> List[Dict]:
+        with self.cache_lock:
+            return copy.deepcopy(self.cached_data)
+    
+    def get_merit_scores(self) -> Dict[str, Dict]:
+        with self.cache_lock:
+            return copy.deepcopy(self.cached_merit_scores)
+
+manager = BitstreamManager()
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def format_bits(bits: List[int]) -> str:
+    return "".join(str(b) for b in bits) if bits else "—"
+
+def format_rr(rr: Optional[float]) -> str:
+    if rr is None:
+        return "—"
+    if rr <= 0:
+        return "0:1"
+    return f"{rr:.2f}:1" if rr < 10 else f"{rr:.0f}:1"
+
+def format_band(threshold_pct: float) -> str:
+    if threshold_pct < 0.1:
+        return f"{threshold_pct:.4f}%"
+    elif threshold_pct < 1:
+        return f"{threshold_pct:.3f}%"
+    else:
+        return f"{threshold_pct:.2f}%"
+
+def get_table_data() -> pd.DataFrame:
+    data = manager.get_data()
+    merit_scores = manager.get_merit_scores()
+    
+    if not data:
+        return pd.DataFrame()
+    
+    rows = []
+    for d in data:
+        symbol = d['symbol']
+        merit = merit_scores.get(symbol, {})
+        
+        chg_str = "—"
+        if d['stasis_price_change_pct'] is not None:
+            sign = "+" if d['stasis_price_change_pct'] >= 0 else ""
+            chg_str = f"{sign}{d['stasis_price_change_pct']:.2f}%"
+        
+        w52_str = "—"
+        if d['week52_percentile'] is not None:
+            w52_str = f"{d['week52_percentile']:.0f}%"
+        
+        merit_score = merit.get('weighted_score', 0)
+        stasis_levels = merit.get('stasis_levels', 0)
+        
+        if stasis_levels > 0:
+            merit_str = f"{merit_score:.0f} ({stasis_levels})"
+        else:
+            merit_str = "—"
+        
+        # Type indicator
+        type_str = "ETF" if d['is_etf'] else "STK"
+        
+        rows.append({
+            'Type': type_str,
+            'Symbol': symbol,
+            'Merit': merit_str,
+            'Merit_Val': merit_score,
+            'Levels': stasis_levels,
+            'Band': format_band(d['threshold_pct']),
+            'Band_Val': d['threshold'],
+            'Stasis': d['stasis'],
+            'Dir': d['direction'] or '—',
+            'Str': d['signal_strength'] or '—',
+            'Current': f"${d['current_price']:.2f}" if d['current_price'] else "—",
+            'Current_Val': d['current_price'] or 0,
+            'Anchor': f"${d['anchor_price']:.2f}" if d['anchor_price'] else "—",
+            'Anchor_Val': d['anchor_price'] or 0,
+            'TP': f"${d['take_profit']:.2f}" if d['take_profit'] else "—",
+            'TP_Val': d['take_profit'] or 0,
+            'SL': f"${d['stop_loss']:.2f}" if d['stop_loss'] else "—",
+            'SL_Val': d['stop_loss'] or 0,
+            'R:R': format_rr(d['risk_reward']),
+            'RR_Val': d['risk_reward'] if d['risk_reward'] is not None else -1,
+            '→TP': f"{d['distance_to_tp_pct']:.3f}%" if d['distance_to_tp_pct'] else "—",
+            '→TP_Val': d['distance_to_tp_pct'] or 0,
+            '→SL': f"{d['distance_to_sl_pct']:.3f}%" if d['distance_to_sl_pct'] else "—",
+            '→SL_Val': d['distance_to_sl_pct'] or 0,
+            'Started': d['stasis_start_str'],
+            'Duration': d['stasis_duration_str'],
+            'Dur_Val': d['duration_seconds'],
+            'Chg': chg_str,
+            'Chg_Val': d['stasis_price_change_pct'] if d['stasis_price_change_pct'] else 0,
+            '52W': w52_str,
+            '52W_Val': d['week52_percentile'] if d['week52_percentile'] is not None else -1,
+            'Bits': d['total_bits'],
+            'Recent': format_bits(d['recent_bits']),
+            'Tradable': '✅' if d['is_tradable'] else '',
+            'Is_Tradable': d['is_tradable'],
+            'Is_ETF': d['is_etf'],
+        })
+    
+    return pd.DataFrame(rows)
+
+# ============================================================================
+# DASH APP
+# ============================================================================
+
+CUSTOM_CSS = """
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700;800;900&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@400;500;600;700&display=swap');
+
+body { 
+    background-color: #0a0a0a !important; 
+}
+
+.title-font {
+    font-family: 'Orbitron', sans-serif !important;
+}
+
+.data-font {
+    font-family: 'Roboto Mono', monospace !important;
+}
+
+h1, h2, h3, h4, h5, h6, .btn, label, .nav-link, .card-header {
+    font-family: 'Orbitron', sans-serif !important;
+}
+
+td, input, .form-control, pre, code {
+    font-family: 'Roboto Mono', monospace !important;
+}
+
+.Select-control, .Select-menu-outer, .Select-option, .Select-value-label {
+    font-family: 'Roboto Mono', monospace !important;
+    font-size: 11px !important;
+}
+
+.alert-flash {
+    animation: flash 0.5s ease-in-out 3;
+}
+
+@keyframes flash {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+}
+
+.alert-card {
+    border: 1px solid #ff6600;
+    background: linear-gradient(135deg, #1a1a2e 0%, #2d2a4a 100%);
+}
+
+.alert-triggered {
+    background: linear-gradient(135deg, #2d1a1a 0%, #4a2a2a 100%) !important;
+    border-color: #ff4444 !important;
+}
+"""
+
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.CYBORG], suppress_callback_exceptions=True)
+app.title = "Beyond Price and Time"
+server = app.server
+
+app.index_string = '''
+<!DOCTYPE html>
+<html>
+    <head>
+        {%metas%}
+        <title>{%title%}</title>
+        {%favicon%}
+        {%css%}
+        <style>''' + CUSTOM_CSS + '''</style>
+    </head>
+    <body>
+        {%app_entry%}
+        <footer>
+            {%config%}
+            {%scripts%}
+            {%renderer%}
+        </footer>
+    </body>
+</html>
+'''
+
+# Alert Modal Component
+def create_alert_modal():
+    return dbc.Modal([
+        dbc.ModalHeader([
+            html.H5("🔔 PRICE ALERTS", className="title-font text-warning mb-0")
+        ], style={'backgroundColor': '#1a1a2e'}),
+        dbc.ModalBody([
+            # Add New Alert Section
+            dbc.Card([
+                dbc.CardHeader([
+                    html.Span("➕ CREATE NEW ALERT", className="title-font", style={'fontSize': '11px'})
+                ], style={'backgroundColor': '#2a2a4e', 'padding': '8px'}),
+                dbc.CardBody([
+                    dbc.Row([
+                        dbc.Col([
+                            dbc.Label("Symbol", className="title-font", style={'fontSize': '10px'}),
+                            dcc.Dropdown(
+                                id='alert-symbol',
+                                options=[{'label': s, 'value': s} for s in config.symbols],
+                                placeholder="Select Symbol",
+                                style={'fontSize': '11px'}
+                            )
+                        ], width=3),
+                        dbc.Col([
+                            dbc.Label("Target Price", className="title-font", style={'fontSize': '10px'}),
+                            dbc.Input(
+                                id='alert-price',
+                                type='number',
+                                placeholder="$0.00",
+                                step=0.01,
+                                style={'fontSize': '11px', 'fontFamily': 'Roboto Mono'}
+                            )
+                        ], width=2),
+                        dbc.Col([
+                            dbc.Label("Type", className="title-font", style={'fontSize': '10px'}),
+                            dcc.Dropdown(
+                                id='alert-type',
+                                options=[
+                                    {'label': '📈 ABOVE', 'value': 'ABOVE'},
+                                    {'label': '📉 BELOW', 'value': 'BELOW'},
+                                    {'label': '🔄 CROSS', 'value': 'CROSS'},
+                                ],
+                                value='ABOVE',
+                                clearable=False,
+                                style={'fontSize': '11px'}
+                            )
+                        ], width=2),
+                        dbc.Col([
+                            dbc.Label("Note (Optional)", className="title-font", style={'fontSize': '10px'}),
+                            dbc.Input(
+                                id='alert-note',
+                                type='text',
+                                placeholder="Note...",
+                                maxLength=50,
+                                style={'fontSize': '11px', 'fontFamily': 'Roboto Mono'}
+                            )
+                        ], width=3),
+                        dbc.Col([
+                            dbc.Label(" ", className="title-font", style={'fontSize': '10px'}),
+                            dbc.Button(
+                                "CREATE",
+                                id='btn-create-alert',
+                                color="success",
+                                className="title-font w-100",
+                                style={'fontSize': '10px'}
+                            )
+                        ], width=2),
+                    ], className="g-2"),
+                    html.Div(id='alert-create-feedback', className="mt-2")
+                ], style={'padding': '10px'})
+            ], className="mb-3 alert-card"),
+            
+            # Current Price Display
+            html.Div(id='alert-current-price', className="text-center mb-3"),
+            
+            # Active Alerts Table
+            dbc.Card([
+                dbc.CardHeader([
+                    html.Span("📋 ACTIVE ALERTS", className="title-font", style={'fontSize': '11px'}),
+                    dbc.Badge(id='active-alert-count', color="success", className="ms-2")
+                ], style={'backgroundColor': '#2a2a4e', 'padding': '8px'}),
+                dbc.CardBody([
+                    html.Div(id='active-alerts-table')
+                ], style={'padding': '10px', 'maxHeight': '200px', 'overflowY': 'auto'})
+            ], className="mb-3 alert-card"),
+            
+            # Triggered Alerts Table
+            dbc.Card([
+                dbc.CardHeader([
+                    html.Span("🚨 TRIGGERED ALERTS", className="title-font", style={'fontSize': '11px'}),
+                    dbc.Badge(id='triggered-alert-count', color="danger", className="ms-2"),
+                    dbc.Button(
+                        "CLEAR ALL",
+                        id='btn-clear-triggered',
+                        color="secondary",
+                        size="sm",
+                        className="title-font ms-auto",
+                        style={'fontSize': '9px'}
+                    )
+                ], style={'backgroundColor': '#2a2a4e', 'padding': '8px', 'display': 'flex', 'alignItems': 'center'}),
+                dbc.CardBody([
+                    html.Div(id='triggered-alerts-table')
+                ], style={'padding': '10px', 'maxHeight': '150px', 'overflowY': 'auto'})
+            ], className="alert-card"),
+            
+        ], style={'backgroundColor': '#0a0a0a'}),
+        dbc.ModalFooter([
+            dbc.Button("CLOSE", id="close-alert-modal", className="title-font", color="secondary")
+        ], style={'backgroundColor': '#1a1a2e'})
+    ], id="alert-modal", size="xl", is_open=False, backdrop="static")
+
+
+# Alert Notification Toast
+def create_alert_toast():
+    return dbc.Toast(
+        id="alert-toast",
+        header="🚨 PRICE ALERT TRIGGERED!",
+        icon="danger",
+        is_open=False,
+        dismissable=True,
+        duration=10000,
+        style={
+            "position": "fixed",
+            "top": 66,
+            "right": 10,
+            "width": 350,
+            "zIndex": 9999,
+            "backgroundColor": "#2d1a1a",
+            "border": "2px solid #ff4444",
+        },
+        header_style={"color": "#ff4444", "fontFamily": "Orbitron", "fontWeight": "bold"}
+    )
+
+
+app.layout = dbc.Container([
+    # Alert Toast Notification
+    create_alert_toast(),
+    
+    # Alert Modal
+    create_alert_modal(),
+    
+    # Header - FIXED LAYOUT
+    dbc.Row([
+        dbc.Col([
+            html.Div([
+                html.Img(src='/assets/logo.png', style={'height': '45px', 'marginRight': '12px'}),
+                html.Div([
+                    html.H2("BEYOND PRICE AND TIME", className="text-success mb-0 title-font",
+                           style={'fontSize': '22px', 'fontWeight': '700', 'letterSpacing': '2px'}),
+                    html.P("REAL-TIME STASIS DETECTION", className="text-info title-font",
+                          style={'fontSize': '9px', 'letterSpacing': '1px', 'marginBottom': '0'}),
+                ], style={'display': 'inline-block', 'verticalAlign': 'middle'}),
+            ], style={'display': 'flex', 'alignItems': 'center'})
+        ], width=4),
+        dbc.Col([
+            # Alert Button with Badge
+            dbc.Button([
+                "🔔 ALERTS ",
+                dbc.Badge(id='alert-badge', color="danger", className="ms-1")
+            ], id="open-alert-modal", color="warning", outline=True, size="sm",
+               className="title-font", style={'fontSize': '10px', 'letterSpacing': '1px'})
+        ], width=2, className="text-center"),
+        dbc.Col([
+            html.Div(id='connection-status', className="text-end")
+        ], width=2),
+        dbc.Col([
+            html.Div(id='stats-summary', className="text-end", style={'fontSize': '10px'})
+        ], width=4)
+    ], className="mb-2 mt-2", style={'alignItems': 'center'}),
+    
+    # Stats Bar
+    dbc.Row([
+        dbc.Col([
+            dbc.Card([
+                dbc.CardBody([
+                    html.Div(id='stats-display', className="text-center")
+                ], style={'padding': '6px'})
+            ], style={'backgroundColor': '#1a2a3a', 'border': '1px solid #00ff88'})
+        ])
+    ], className="mb-2"),
+    
+    # Filters - FIXED LAYOUT with proper spacing
+    dbc.Row([
+        dbc.Col([
+            dbc.ButtonGroup([
+                dbc.Button("ALL", id="btn-all", color="secondary", outline=True, size="sm", 
+                          className="title-font", style={'letterSpacing': '1px', 'fontSize': '9px', 'padding': '4px 8px'}),
+                dbc.Button("TRADE", id="btn-tradable", color="success", outline=True, size="sm", 
+                          active=True, className="title-font", style={'letterSpacing': '1px', 'fontSize': '9px', 'padding': '4px 8px'}),
+            ], size="sm")
+        ], width="auto", style={'paddingRight': '5px'}),
+        dbc.Col([
+            dcc.Dropdown(id='filter-type',
+                        options=[{'label': 'ALL', 'value': 'ALL'},
+                                {'label': 'ETF', 'value': 'ETF'},
+                                {'label': 'STK', 'value': 'STK'}],
+                        value='ALL', clearable=False, style={'fontSize': '10px', 'minWidth': '70px'})
+        ], width="auto", style={'paddingRight': '5px'}),
+        dbc.Col([
+            dcc.Dropdown(id='filter-symbol', 
+                        options=[{'label': 'ALL', 'value': 'ALL'}] + 
+                        [{'label': s, 'value': s} for s in config.symbols],
+                        value='ALL', clearable=False, style={'fontSize': '10px', 'minWidth': '80px'})
+        ], width="auto", style={'paddingRight': '5px'}),
+        dbc.Col([
+            dcc.Dropdown(id='filter-threshold', 
+                        options=[{'label': 'ALL BANDS', 'value': 'ALL'}] + 
+                        [{'label': format_band(t*100), 'value': t} for t in config.thresholds],
+                        value='ALL', clearable=False, style={'fontSize': '10px', 'minWidth': '90px'})
+        ], width="auto", style={'paddingRight': '5px'}),
+        dbc.Col([
+            dcc.Input(id='filter-stasis', type='number', value=3, min=0,
+                     placeholder="Min",
+                     style={'width': '55px', 'fontSize': '10px', 'fontFamily': 'Roboto Mono', 'padding': '5px'})
+        ], width="auto", style={'paddingRight': '5px'}),
+        dbc.Col([
+            dcc.Dropdown(id='filter-direction',
+                        options=[{'label': 'DIR', 'value': 'ALL'}, 
+                                {'label': 'LONG', 'value': 'LONG'},
+                                {'label': 'SHORT', 'value': 'SHORT'}],
+                        value='ALL', clearable=False, style={'fontSize': '10px', 'minWidth': '70px'})
+        ], width="auto", style={'paddingRight': '5px'}),
+        dbc.Col([
+            dcc.Dropdown(id='filter-rr',
+                        options=[{'label': 'R:R', 'value': -1},
+                                {'label': '≥1', 'value': 1}, 
+                                {'label': '≥2', 'value': 2},
+                                {'label': '≥3', 'value': 3}],
+                        value=-1, clearable=False, style={'fontSize': '10px', 'minWidth': '60px'})
+        ], width="auto", style={'paddingRight': '5px'}),
+        dbc.Col([
+            dcc.Dropdown(id='filter-merit',
+                        options=[{'label': 'MERIT', 'value': 0},
+                                {'label': '≥10', 'value': 10},
+                                {'label': '≥25', 'value': 25},
+                                {'label': '≥50', 'value': 50}],
+                        value=0, clearable=False, style={'fontSize': '10px', 'minWidth': '70px'})
+        ], width="auto", style={'paddingRight': '5px'}),
+        dbc.Col([
+            dcc.Dropdown(id='filter-duration',
+                        options=[{'label': 'DUR', 'value': 0}, 
+                                {'label': '5m+', 'value': 300},
+                                {'label': '15m+', 'value': 900}, 
+                                {'label': '1h+', 'value': 3600}],
+                        value=0, clearable=False, style={'fontSize': '10px', 'minWidth': '60px'})
+        ], width="auto", style={'paddingRight': '5px'}),
+        dbc.Col([
+            dcc.Dropdown(id='filter-rows',
+                        options=[{'label': '50', 'value': 50}, 
+                                {'label': '100', 'value': 100},
+                                {'label': '250', 'value': 250},
+                                {'label': 'ALL', 'value': 5000}],
+                        value=100, clearable=False, style={'fontSize': '10px', 'minWidth': '60px'})
+        ], width="auto", style={'paddingRight': '5px'}),
+        dbc.Col([
+            dcc.Dropdown(id='filter-sort',
+                        options=[{'label': 'MERIT↓', 'value': 'merit'},
+                                {'label': 'STASIS↓', 'value': 'stasis'}, 
+                                {'label': 'R:R↓', 'value': 'rr'}],
+                        value='merit', clearable=False, style={'fontSize': '10px', 'minWidth': '80px'})
+        ], width="auto"),
+    ], className="mb-2", style={'flexWrap': 'nowrap', 'overflowX': 'auto'}),
+    
+    # Table
+    dbc.Row([
+        dbc.Col([
+            dash_table.DataTable(
+                id='main-table',
+                columns=[
+                    {'name': '✓', 'id': 'Tradable', 'sortable': True},
+                    {'name': 'T', 'id': 'Type', 'sortable': True},
+                    {'name': 'SYM', 'id': 'Symbol', 'sortable': True},
+                    {'name': 'MERIT', 'id': 'Merit', 'sortable': True},
+                    {'name': 'BAND', 'id': 'Band', 'sortable': True},
+                    {'name': 'STS', 'id': 'Stasis', 'sortable': True},
+                    {'name': 'DIR', 'id': 'Dir', 'sortable': True},
+                    {'name': 'STR', 'id': 'Str', 'sortable': True},
+                    {'name': 'CURRENT', 'id': 'Current', 'sortable': True},
+                    {'name': 'ANCHOR', 'id': 'Anchor', 'sortable': True},
+                    {'name': 'TP', 'id': 'TP', 'sortable': True},
+                    {'name': 'SL', 'id': 'SL', 'sortable': True},
+                    {'name': 'R:R', 'id': 'R:R', 'sortable': True},
+                    {'name': '→TP', 'id': '→TP', 'sortable': True},
+                    {'name': '→SL', 'id': '→SL', 'sortable': True},
+                    {'name': 'START', 'id': 'Started', 'sortable': True},
+                    {'name': 'DUR', 'id': 'Duration', 'sortable': True},
+                    {'name': 'CHG', 'id': 'Chg', 'sortable': True},
+                    {'name': '52W', 'id': '52W', 'sortable': True},
+                    {'name': 'BITS', 'id': 'Recent', 'sortable': False},
+                ],
+                sort_action='native',
+                sort_mode='multi',
+                sort_by=[{'column_id': 'Merit', 'direction': 'desc'}],
+                style_table={'height': '65vh', 'overflowY': 'auto'},
+                style_cell={
+                    'backgroundColor': '#1a1a2e', 
+                    'color': 'white',
+                    'padding': '3px 5px', 
+                    'fontSize': '10px',
+                    'fontFamily': 'Roboto Mono, monospace', 
+                    'whiteSpace': 'nowrap',
+                    'textAlign': 'right',
+                    'minWidth': '40px',
+                },
+                style_cell_conditional=[
+                    {'if': {'column_id': 'Type'}, 'textAlign': 'center', 'fontWeight': '600', 'minWidth': '35px'},
+                    {'if': {'column_id': 'Symbol'}, 'textAlign': 'left', 'fontWeight': '700', 'color': '#00ff88'},
+                    {'if': {'column_id': 'Merit'}, 'textAlign': 'center', 'fontWeight': '700'},
+                    {'if': {'column_id': 'Dir'}, 'textAlign': 'center'},
+                    {'if': {'column_id': 'Str'}, 'textAlign': 'center'},
+                    {'if': {'column_id': 'Tradable'}, 'textAlign': 'center'},
+                    {'if': {'column_id': 'Recent'}, 'textAlign': 'left', 'minWidth': '90px'},
+                ],
+                style_header={
+                    'backgroundColor': '#2a2a4e', 
+                    'color': '#00ff88',
+                    'fontWeight': '700', 
+                    'fontSize': '9px',
+                    'fontFamily': 'Orbitron, sans-serif',
+                    'borderBottom': '2px solid #00ff88',
+                    'textAlign': 'center',
+                    'letterSpacing': '0.5px',
+                },
+                style_data_conditional=[
+                    # Type coloring
+                    {'if': {'filter_query': '{Type} = "ETF"', 'column_id': 'Type'}, 'color': '#00ffff'},
+                    {'if': {'filter_query': '{Type} = "STK"', 'column_id': 'Type'}, 'color': '#ffaa00'},
+                    # Merit score coloring
+                    {'if': {'filter_query': '{Merit_Val} >= 100', 'column_id': 'Merit'}, 
+                     'color': '#ff00ff', 'fontWeight': 'bold', 'backgroundColor': '#3d2a4d'},
+                    {'if': {'filter_query': '{Merit_Val} >= 50 && {Merit_Val} < 100', 'column_id': 'Merit'}, 
+                     'color': '#ffff00', 'fontWeight': 'bold'},
+                    {'if': {'filter_query': '{Merit_Val} >= 25 && {Merit_Val} < 50', 'column_id': 'Merit'}, 
+                     'color': '#00ffff', 'fontWeight': 'bold'},
+                    {'if': {'filter_query': '{Merit_Val} >= 10 && {Merit_Val} < 25', 'column_id': 'Merit'}, 
+                     'color': '#88ff88'},
+                    # High merit row highlighting
+                    {'if': {'filter_query': '{Merit_Val} >= 50'}, 'backgroundColor': '#2d3a4d'},
+                    # Stasis coloring
+                    {'if': {'filter_query': '{Stasis} >= 10'}, 'backgroundColor': '#2d4a2d'},
+                    {'if': {'filter_query': '{Stasis} >= 7 && {Stasis} < 10'}, 'backgroundColor': '#2a3a2a'},
+                    # Direction coloring
+                    {'if': {'filter_query': '{Dir} = "LONG"', 'column_id': 'Dir'}, 'color': '#00ff00', 'fontWeight': 'bold'},
+                    {'if': {'filter_query': '{Dir} = "SHORT"', 'column_id': 'Dir'}, 'color': '#ff4444', 'fontWeight': 'bold'},
+                    # Strength coloring
+                    {'if': {'filter_query': '{Str} = "VERY_STRONG"', 'column_id': 'Str'}, 'color': '#ffff00'},
+                    {'if': {'filter_query': '{Str} = "STRONG"', 'column_id': 'Str'}, 'color': '#ffaa00'},
+                    # Price columns
+                    {'if': {'column_id': 'Current'}, 'color': '#00ffff', 'fontWeight': '600'},
+                    {'if': {'column_id': 'Anchor'}, 'color': '#ffaa00'},
+                    {'if': {'column_id': 'TP'}, 'color': '#00ff00'},
+                    {'if': {'column_id': 'SL'}, 'color': '#ff4444'},
+                    # R:R coloring
+                    {'if': {'filter_query': '{RR_Val} >= 2', 'column_id': 'R:R'}, 'color': '#00ff00', 'fontWeight': '600'},
+                    {'if': {'filter_query': '{RR_Val} >= 1 && {RR_Val} < 2', 'column_id': 'R:R'}, 'color': '#88ff88'},
+                    # Change coloring
+                    {'if': {'filter_query': '{Chg} contains "+"', 'column_id': 'Chg'}, 'color': '#00ff00'},
+                    {'if': {'filter_query': '{Chg} contains "-"', 'column_id': 'Chg'}, 'color': '#ff4444'},
+                    # 52W coloring
+                    {'if': {'filter_query': '{52W_Val} >= 0 && {52W_Val} <= 20', 'column_id': '52W'}, 'color': '#00ff00'},
+                    {'if': {'filter_query': '{52W_Val} >= 80', 'column_id': '52W'}, 'color': '#ff4444'},
+                    # Alternating rows
+                    {'if': {'row_index': 'odd'}, 'backgroundColor': '#151520'},
+                ]
+            )
+        ])
+    ]),
+    
+    # Footer
+    dbc.Row([
+        dbc.Col([
+            html.Div([
+                html.Span("🟢 REAL-TIME", className="title-font", style={'color': '#00ff88', 'fontSize': '9px', 'fontWeight': 'bold'}),
+                html.Span(" | ", style={'fontSize': '8px'}),
+                html.Span("MERIT", style={'color': '#ff00ff', 'fontSize': '8px', 'fontWeight': 'bold'}),
+                html.Span("=Score(Lvls) | ", style={'fontSize': '8px'}),
+                html.Span("ETF", style={'color': '#00ffff', 'fontSize': '8px'}),
+                html.Span("/", style={'fontSize': '8px'}),
+                html.Span("STK", style={'color': '#ffaa00', 'fontSize': '8px'}),
+                html.Span(" | ", style={'fontSize': '8px'}),
+                html.Span("TP", style={'color': '#00ff00', 'fontSize': '8px'}),
+                html.Span("/", style={'fontSize': '8px'}),
+                html.Span("SL", style={'color': '#ff4444', 'fontSize': '8px'}),
+                html.Span(" | ", style={'fontSize': '8px'}),
+                html.Span("🔔 ALERTS", style={'color': '#ff6600', 'fontSize': '8px'}),
+            ], className="text-center text-muted mt-1"),
+            html.Hr(style={'borderColor': '#333', 'margin': '5px 0'}),
+            html.P("© 2026 TRUTH COMMUNICATIONS LLC",
+                  className="text-muted text-center mb-0 title-font",
+                  style={'fontSize': '8px', 'letterSpacing': '1px'}),
+        ])
+    ]),
+    
+    dcc.Store(id='view-mode', data='tradable'),
+    dcc.Store(id='triggered-alerts-store', data=[]),
+    dcc.Interval(id='refresh-interval', interval=config.update_interval_ms, n_intervals=0),
+    dcc.Interval(id='alert-check-interval', interval=1000, n_intervals=0),  # Check alerts every second
+    
+], fluid=True, className="p-2", style={'backgroundColor': '#0a0a0a'})
+
+# ============================================================================
+# CALLBACKS
+# ============================================================================
+
+@app.callback(
+    [Output('btn-all', 'active'), Output('btn-tradable', 'active'), Output('view-mode', 'data')],
+    [Input('btn-all', 'n_clicks'), Input('btn-tradable', 'n_clicks')],
+    [State('view-mode', 'data')]
+)
+def toggle_view(n1, n2, current):
+    ctx = callback_context
+    if not ctx.triggered:
+        return False, True, 'tradable'
+    btn = ctx.triggered[0]['prop_id'].split('.')[0]
+    if btn == 'btn-all':
+        return True, False, 'all'
+    return False, True, 'tradable'
+
+@app.callback(
+    Output('connection-status', 'children'),
+    Input('refresh-interval', 'n_intervals')
+)
+def update_status(n):
+    if not manager.backfill_complete:
+        return html.Span(f"⏳ LOADING {manager.backfill_progress}%", 
+                        className="text-warning title-font", style={'fontSize': '11px'})
+    
+    status = price_feed.get_status()
+    if status['connected'] == 0:
+        return html.Span("🔴 CONNECTING", className="text-warning", style={'fontSize': '11px'})
+    elif status['connected'] < status['total']:
+        return html.Span(f"🟡 {status['connected']}/{status['total']}", 
+                        className="text-info data-font", style={'fontSize': '11px'})
+    return html.Span(f"🟢 {status['connected']}/{status['total']} | {status['message_count']:,}", 
+                    className="text-success data-font", style={'fontSize': '11px'})
+
+@app.callback(
+    Output('stats-summary', 'children'),
+    Input('refresh-interval', 'n_intervals')
+)
+def update_stats_summary(n):
+    if not manager.backfill_complete:
+        return ""
+    
+    data = manager.get_data()
+    if not data:
+        return ""
+    
+    tradable = sum(1 for d in data if d['is_tradable'])
+    etf_count = len(config.etf_symbols)
+    stock_count = len(config.symbols) - etf_count
+    
+    # Add alert stats
+    alert_stats = alert_manager.get_stats()
+    
+    return html.Span([
+        html.Span(f"ETF:{etf_count} ", style={'color': '#00ffff'}),
+        html.Span(f"STK:{stock_count} ", style={'color': '#ffaa00'}),
+        html.Span(f"SIGNALS:{tradable} ", style={'color': '#00ff88', 'fontWeight': 'bold'}),
+        html.Span(f"🔔:{alert_stats['active']}", style={'color': '#ff6600'}),
+    ], className="data-font")
+
+@app.callback(
+    Output('stats-display', 'children'),
+    Input('refresh-interval', 'n_intervals')
+)
+def update_stats(n):
+    if not manager.backfill_complete:
+        return html.Span(f"⏳ LOADING {len(config.symbols)} symbols... {manager.backfill_progress}%", 
+                        className="text-warning title-font")
+    
+    data = manager.get_data()
+    merit_scores = manager.get_merit_scores()
+    
+    if not data:
+        return html.Span("LOADING...", className="text-muted title-font")
+    
+    tradable = [d for d in data if d['is_tradable']]
+    with_rr = [d for d in tradable if d['risk_reward'] is not None and d['risk_reward'] > 0]
+    avg_rr = np.mean([d['risk_reward'] for d in with_rr]) if with_rr else 0
+    long_count = sum(1 for d in tradable if d['direction'] == 'LONG')
+    short_count = sum(1 for d in tradable if d['direction'] == 'SHORT')
+    max_stasis = max([d['stasis'] for d in data]) if data else 0
+    
+    top_merit = max(merit_scores.values(), key=lambda x: x['weighted_score'], default={'weighted_score': 0})
+    top_merit_symbol = [k for k, v in merit_scores.items() if v['weighted_score'] == top_merit['weighted_score']]
+    top_merit_symbol = top_merit_symbol[0] if top_merit_symbol else "—"
+    
+    multi_level = sum(1 for m in merit_scores.values() if m['stasis_levels'] >= 2)
+    
+    return html.Div([
+        html.Span("🎯 TRADABLE: ", className="title-font", style={'fontSize': '10px'}),
+        html.Span(f"{len(tradable)}", className="data-font text-success", style={'fontSize': '11px', 'fontWeight': '600'}),
+        html.Span("  🏆 TOP: ", className="title-font ms-2", style={'fontSize': '10px'}),
+        html.Span(f"{top_merit_symbol}({top_merit['weighted_score']:.0f})", 
+                 className="data-font text-warning", style={'fontSize': '11px', 'fontWeight': '600'}),
+        html.Span("  📊 MULTI: ", className="title-font ms-2", style={'fontSize': '10px'}),
+        html.Span(f"{multi_level}", className="data-font text-info", style={'fontSize': '11px'}),
+        html.Span("  📈 L: ", className="title-font ms-2", style={'fontSize': '10px'}),
+        html.Span(f"{long_count}", className="data-font text-success", style={'fontSize': '11px'}),
+        html.Span("  📉 S: ", className="title-font ms-2", style={'fontSize': '10px'}),
+        html.Span(f"{short_count}", className="data-font text-danger", style={'fontSize': '11px'}),
+        html.Span("  ⚡ MAX: ", className="title-font ms-2", style={'fontSize': '10px'}),
+        html.Span(f"{max_stasis}", className="data-font text-warning", style={'fontSize': '11px'}),
+        html.Span("  R:R: ", className="title-font ms-2", style={'fontSize': '10px'}),
+        html.Span(f"{avg_rr:.1f}", className="data-font text-info", style={'fontSize': '11px'}),
+    ])
+
+@app.callback(
+    Output('main-table', 'data'),
+    [Input('refresh-interval', 'n_intervals'),
+     Input('view-mode', 'data'),
+     Input('filter-type', 'value'),
+     Input('filter-symbol', 'value'),
+     Input('filter-threshold', 'value'),
+     Input('filter-stasis', 'value'),
+     Input('filter-direction', 'value'),
+     Input('filter-rr', 'value'),
+     Input('filter-merit', 'value'),
+     Input('filter-duration', 'value'),
+     Input('filter-rows', 'value'),
+     Input('filter-sort', 'value')]
+)
+def update_table(n, view_mode, type_filter, sym, thresh, stasis, direction, rr, merit, duration, rows, sort):
+    df = get_table_data()
+    if df.empty:
+        return []
+    
+    if view_mode == 'tradable':
+        df = df[df['Is_Tradable'] == True]
+    
+    if type_filter == 'ETF':
+        df = df[df['Is_ETF'] == True]
+    elif type_filter == 'STK':
+        df = df[df['Is_ETF'] == False]
+    
+    if sym != 'ALL':
+        df = df[df['Symbol'] == sym]
+    if thresh != 'ALL':
+        df = df[df['Band_Val'] == thresh]
+    if stasis and stasis > 0:
+        df = df[df['Stasis'] >= stasis]
+    if direction != 'ALL':
+        df = df[df['Dir'] == direction]
+    if rr is not None and rr >= 0:
+        df = df[(df['RR_Val'].notna()) & (df['RR_Val'] >= rr)]
+    if merit is not None and merit > 0:
+        df = df[df['Merit_Val'] >= merit]
+    if duration and duration > 0:
+        df = df[df['Dur_Val'] >= duration]
+    
+    if sort == 'merit':
+        df = df.sort_values(['Merit_Val', 'Stasis'], ascending=[False, False])
+    elif sort == 'stasis':
+        df = df.sort_values(['Stasis', 'Merit_Val'], ascending=[False, False])
+    elif sort == 'rr':
+        df = df.sort_values(['RR_Val', 'Merit_Val'], ascending=[False, False])
+    
+    df = df.head(rows)
+    
+    drop_cols = ['Band_Val', 'Current_Val', 'Anchor_Val', 'TP_Val', 'SL_Val', 
+                 'RR_Val', '→TP_Val', '→SL_Val', 'Dur_Val', 'Chg_Val', '52W_Val', 
+                 'Is_Tradable', 'Merit_Val', 'Levels', 'Bits', 'Is_ETF']
+    df = df.drop(columns=drop_cols, errors='ignore')
+    
+    return df.to_dict('records')
+
+
+# ============================================================================
+# ALERT CALLBACKS
+# ============================================================================
+
+@app.callback(
+    Output('alert-modal', 'is_open'),
+    [Input('open-alert-modal', 'n_clicks'),
+     Input('close-alert-modal', 'n_clicks')],
+    [State('alert-modal', 'is_open')]
+)
+def toggle_alert_modal(n1, n2, is_open):
+    ctx = callback_context
+    if not ctx.triggered:
+        return is_open
+    return not is_open
+
+
+@app.callback(
+    Output('alert-badge', 'children'),
+    Input('alert-check-interval', 'n_intervals')
+)
+def update_alert_badge(n):
+    stats = alert_manager.get_stats()
+    if stats['active'] > 0:
+        return str(stats['active'])
+    return ""
+
+
+@app.callback(
+    Output('alert-current-price', 'children'),
+    [Input('alert-symbol', 'value'),
+     Input('alert-check-interval', 'n_intervals')]
+)
+def update_alert_current_price(symbol, n):
+    if not symbol:
+        return ""
+    
+    prices = price_feed.get_all_prices()
+    current_price = prices.get(symbol)
+    
+    if current_price is None:
+        return html.Span(f"{symbol}: No price data", className="text-muted data-font")
+    
+    # Get 52W data for context
+    w52 = config.week52_data.get(symbol, {})
+    w52_high = w52.get('high')
+    w52_low = w52.get('low')
+    
+    context = ""
+    if w52_high and w52_low:
+        context = f" | 52W: ${w52_low:.2f} - ${w52_high:.2f}"
+    
+    return html.Span([
+        html.Span(f"{symbol}: ", style={'color': '#00ff88', 'fontWeight': 'bold'}),
+        html.Span(f"${current_price:.2f}", style={'color': '#00ffff', 'fontWeight': 'bold', 'fontSize': '14px'}),
+        html.Span(context, style={'color': '#888', 'fontSize': '10px'}),
+    ], className="data-font")
+
+
+@app.callback(
+    [Output('alert-create-feedback', 'children'),
+     Output('alert-price', 'value'),
+     Output('alert-note', 'value')],
+    Input('btn-create-alert', 'n_clicks'),
+    [State('alert-symbol', 'value'),
+     State('alert-price', 'value'),
+     State('alert-type', 'value'),
+     State('alert-note', 'value')]
+)
+def create_alert(n_clicks, symbol, price, alert_type, note):
+    if not n_clicks:
+        return "", dash.no_update, dash.no_update
+    
+    if not symbol:
+        return html.Span("⚠️ Select a symbol", className="text-warning", style={'fontSize': '10px'}), dash.no_update, dash.no_update
+    
+    if not price or price <= 0:
+        return html.Span("⚠️ Enter a valid price", className="text-warning", style={'fontSize': '10px'}), dash.no_update, dash.no_update
+    
+    alert = alert_manager.add_alert(symbol, price, alert_type, note or "")
+    
+    return html.Span(f"✅ Alert created: {symbol} {alert_type} ${price:.2f}", 
+                    className="text-success", style={'fontSize': '10px'}), None, ""
+
+
+@app.callback(
+    [Output('active-alerts-table', 'children'),
+     Output('active-alert-count', 'children')],
+    Input('alert-check-interval', 'n_intervals')
+)
+def update_active_alerts(n):
+    alerts = alert_manager.get_active_alerts()
+    prices = price_feed.get_all_prices()
+    
+    if not alerts:
+        return html.Span("No active alerts", className="text-muted", style={'fontSize': '10px'}), "0"
+    
+    rows = []
+    for alert in alerts:
+        current_price = prices.get(alert['symbol'])
+        price_str = f"${current_price:.2f}" if current_price else "—"
+        
+        # Calculate distance to target
+        distance_str = "—"
+        distance_color = "#888"
+        if current_price:
+            distance = ((alert['target_price'] - current_price) / current_price) * 100
+            distance_str = f"{'+' if distance >= 0 else ''}{distance:.2f}%"
+            if abs(distance) < 1:
+                distance_color = "#ff6600"  # Close to target
+            elif abs(distance) < 2:
+                distance_color = "#ffaa00"
+        
+        type_icon = "📈" if alert['alert_type'] == "ABOVE" else "📉" if alert['alert_type'] == "BELOW" else "🔄"
+        
+        rows.append(
+            html.Tr([
+                html.Td(alert['symbol'], style={'color': '#00ff88', 'fontWeight': 'bold'}),
+                html.Td(f"{type_icon} {alert['alert_type']}", style={'fontSize': '9px'}),
+                html.Td(f"${alert['target_price']:.2f}", style={'color': '#ffaa00'}),
+                html.Td(price_str, style={'color': '#00ffff'}),
+                html.Td(distance_str, style={'color': distance_color, 'fontWeight': 'bold'}),
+                html.Td(alert.get('note', '')[:15], style={'color': '#888', 'fontSize': '9px'}),
+                html.Td(
+                    dbc.Button("❌", id={'type': 'delete-alert', 'index': alert['id']}, 
+                              color="link", size="sm", style={'padding': '0', 'color': '#ff4444'})
+                ),
+            ], style={'fontSize': '10px'})
+        )
+    
+    table = html.Table([
+        html.Thead(html.Tr([
+            html.Th("SYM", style={'fontSize': '9px', 'color': '#00ff88'}),
+            html.Th("TYPE", style={'fontSize': '9px', 'color': '#00ff88'}),
+            html.Th("TARGET", style={'fontSize': '9px', 'color': '#00ff88'}),
+            html.Th("NOW", style={'fontSize': '9px', 'color': '#00ff88'}),
+            html.Th("DIST", style={'fontSize': '9px', 'color': '#00ff88'}),
+            html.Th("NOTE", style={'fontSize': '9px', 'color': '#00ff88'}),
+            html.Th("", style={'fontSize': '9px'}),
+        ])),
+        html.Tbody(rows)
+    ], className="data-font", style={'width': '100%'})
+    
+    return table, str(len(alerts))
+
+
+@app.callback(
+    Output('triggered-alerts-table', 'children'),
+    Output('triggered-alert-count', 'children'),
+    Input('alert-check-interval', 'n_intervals')
+)
+def update_triggered_alerts(n):
+    alerts = alert_manager.get_triggered_alerts()
+    
+    if not alerts:
+        return html.Span("No triggered alerts", className="text-muted", style={'fontSize': '10px'}), "0"
+    
+    rows = []
+    for alert in alerts[:10]:  # Show last 10
+        triggered_time = datetime.fromisoformat(alert['triggered_at']).strftime("%H:%M:%S") if alert.get('triggered_at') else "—"
+        type_icon = "📈" if alert['alert_type'] == "ABOVE" else "📉" if alert['alert_type'] == "BELOW" else "🔄"
+        
+        rows.append(
+            html.Tr([
+                html.Td(alert['symbol'], style={'color': '#ff4444', 'fontWeight': 'bold'}),
+                html.Td(f"{type_icon}", style={'fontSize': '9px'}),
+                html.Td(f"${alert['target_price']:.2f}", style={'color': '#ffaa00'}),
+                html.Td(f"${alert.get('triggered_price', 0):.2f}", style={'color': '#00ffff'}),
+                html.Td(triggered_time, style={'color': '#888'}),
+                html.Td(alert.get('note', '')[:15], style={'color': '#888', 'fontSize': '9px'}),
+            ], style={'fontSize': '10px'})
+        )
+    
+    table = html.Table([
+        html.Thead(html.Tr([
+            html.Th("SYM", style={'fontSize': '9px', 'color': '#ff4444'}),
+            html.Th("", style={'fontSize': '9px'}),
+            html.Th("TARGET", style={'fontSize': '9px', 'color': '#ff4444'}),
+            html.Th("TRIGGERED", style={'fontSize': '9px', 'color': '#ff4444'}),
+            html.Th("TIME", style={'fontSize': '9px', 'color': '#ff4444'}),
+            html.Th("NOTE", style={'fontSize': '9px', 'color': '#ff4444'}),
+        ])),
+        html.Tbody(rows)
+    ], className="data-font", style={'width': '100%'})
+    
+    return table, str(len(alerts))
+
+
+@app.callback(
+    Output('triggered-alerts-store', 'data'),
+    Input('btn-clear-triggered', 'n_clicks'),
+    prevent_initial_call=True
+)
+def clear_triggered_alerts(n_clicks):
+    if n_clicks:
+        count = alert_manager.clear_triggered()
+        print(f"Cleared {count} triggered alerts")
+    return []
+
+
+# Delete individual alert
+@app.callback(
+    Output({'type': 'delete-alert', 'index': ALL}, 'children'),
+    Input({'type': 'delete-alert', 'index': ALL}, 'n_clicks'),
+    State({'type': 'delete-alert', 'index': ALL}, 'id'),
+    prevent_initial_call=True
+)
+def delete_alert(n_clicks_list, ids):
+    ctx = callback_context
+    if not ctx.triggered:
+        return ["❌"] * len(ids)
+    
+    # Find which button was clicked
+    triggered_id = ctx.triggered[0]['prop_id']
+    if triggered_id and 'index' in triggered_id:
+        try:
+            # Parse the ID to get the alert ID
+            import json as json_parser
+            id_dict = json_parser.loads(triggered_id.replace('.n_clicks', ''))
+            alert_id = id_dict['index']
+            alert_manager.remove_alert(alert_id)
+            print(f"Deleted alert: {alert_id}")
+        except:
+            pass
+    
+    return ["❌"] * len(ids)
+
+
+# Alert toast notification
+@app.callback(
+    [Output('alert-toast', 'is_open'),
+     Output('alert-toast', 'children')],
+    Input('alert-check-interval', 'n_intervals')
+)
+def show_alert_notification(n):
+    triggers = alert_manager.get_new_triggers()
+    
+    if not triggers:
+        return False, ""
+    
+    # Show the most recent trigger
+    trigger = triggers[-1]
+    
+    content = html.Div([
+        html.Div([
+            html.Span(trigger['symbol'], style={'color': '#00ff88', 'fontWeight': 'bold', 'fontSize': '16px'}),
+            html.Span(f" hit ", style={'color': 'white'}),
+            html.Span(f"${trigger['triggered_price']:.2f}", style={'color': '#00ffff', 'fontWeight': 'bold', 'fontSize': '16px'}),
+        ]),
+        html.Div([
+            html.Span(f"Target: ${trigger['target_price']:.2f} ({trigger['alert_type']})", 
+                     style={'color': '#ffaa00', 'fontSize': '12px'}),
+        ]),
+        html.Div([
+            html.Span(trigger.get('note', ''), style={'color': '#888', 'fontSize': '11px', 'fontStyle': 'italic'}),
+        ]) if trigger.get('note') else None,
+        html.Div([
+            html.Span(f"⏰ {trigger['time']}", style={'color': '#888', 'fontSize': '10px'}),
+        ], className="mt-1"),
+    ], className="data-font")
+    
+    return True, content
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+if __name__ == '__main__':
+    print("=" * 70)
+    print("  BEYOND PRICE AND TIME")
+    print("  ETFs + Top 100 Liquid Stocks")
+    print("  © 2026 Truth Communications LLC. All Rights Reserved.")
+    print("=" * 70)
+    
+    print(f"\n📊 Total Symbols: {len(config.symbols)}")
+    print(f"   ETFs: {len(config.etf_symbols)}")
+    print(f"   Stocks: {len(config.symbols) - len(config.etf_symbols)}")
+    
+    print(f"\n📏 Thresholds ({len(config.thresholds)}):")
+    for t in config.thresholds:
+        print(f"   • {t*100:.4f}%")
+    
+    print(f"\n🔢 Total Bitstreams: {len(config.symbols) * len(config.thresholds)}")
+    
+    # Show loaded alerts
+    alert_stats = alert_manager.get_stats()
+    print(f"\n🔔 Loaded Alerts: {alert_stats['active']} active, {alert_stats['triggered']} triggered")
+    
+    print("\n" + "=" * 70)
+    print("📅 FETCHING 52-WEEK DATA")
+    print("=" * 70)
+    config.week52_data = fetch_52_week_data()
+    
+    print("=" * 70)
+    print("📊 FETCHING VOLUME DATA")
+    print("=" * 70)
+    config.volumes = fetch_volume_data()
+    
+    manager.backfill()
+    
+    price_feed.start()
+    manager.start()
+    
+    print("\n✅ Server: http://127.0.0.1:8050")
+    print("\n📋 FEATURES:")
+    print(f"   • {len(config.etf_symbols)} ETFs + {len(config.symbols) - len(config.etf_symbols)} liquid stocks")
+    print("   • 10 threshold levels (0.0625% to 10%)")
+    print(f"   • {len(config.symbols) * len(config.thresholds)} total bitstreams")
+    print("   • Merit score for multi-level confluence")
+    print("   • Type filter (ETF/STK)")
+    print("   • 🔔 PRICE ALERTS with notifications")
+    print("=" * 70 + "\n")
+    
+    threading.Thread(target=lambda: (time.sleep(2), webbrowser.open('http://127.0.0.1:8050')), daemon=True).start()
+    
+    app.run(debug=False, host='127.0.0.1', port=8050)
