@@ -2340,4 +2340,8 @@ if __name__ == '__main__':
     
     threading.Thread(target=lambda: (time.sleep(2), webbrowser.open('http://127.0.0.1:8050')), daemon=True).start()
     
-    app.run(debug=False, host='127.0.0.1', port=8050)
+    import os
+    port = int(os.environ.get('PORT', 8050))
+    print(f"🚀 Starting server on port {port}")
+    app.run(debug=False, host='0.0.0.0', port=port) 
+
