@@ -2286,13 +2286,14 @@ def show_alert_notification(n):
     ], className="data-font")
     
     return True, content
-
-
 # ============================================================================
-# MAIN
+# INITIALIZATION - Runs when module is imported (including by Gunicorn)
 # ============================================================================
 
-if __name__ == '__main__':
+def initialize_app():
+    """Initialize all data and start background threads"""
+    global price_feed, manager
+    
     print("=" * 70)
     print("  BEYOND PRICE AND TIME")
     print("  ETFs + Top 100 Liquid Stocks")
@@ -2328,20 +2329,40 @@ if __name__ == '__main__':
     price_feed.start()
     manager.start()
     
-    print("\n✅ Server: http://127.0.0.1:8050")
-    print("\n📋 FEATURES:")
+    print("\n✅ Initialization complete!")
     print(f"   • {len(config.etf_symbols)} ETFs + {len(config.symbols) - len(config.etf_symbols)} liquid stocks")
     print("   • 10 threshold levels (0.0625% to 10%)")
     print(f"   • {len(config.symbols) * len(config.thresholds)} total bitstreams")
     print("   • Merit score for multi-level confluence")
-    print("   • Type filter (ETF/STK)")
     print("   • 🔔 PRICE ALERTS with notifications")
     print("=" * 70 + "\n")
-    
-    threading.Thread(target=lambda: (time.sleep(2), webbrowser.open('http://127.0.0.1:8050')), daemon=True).start()
-    
+
+
+# Flag to ensure we only initialize once
+_initialized = False
+
+def ensure_initialized():
+    """Ensure app is initialized (call this on first request or at module load)"""
+    global _initialized
+    if not _initialized:
+        _initialized = True
+        # Run initialization in a background thread to not block app startup
+        init_thread = threading.Thread(target=initialize_app, daemon=True)
+        init_thread.start()
+
+
+# Initialize when module loads (works with Gunicorn)
+ensure_initialized()
+
+
+# ============================================================================
+# MAIN - Only runs when executed directly (local development)
+# ============================================================================
+
+if __name__ == '__main__':
     import os
     port = int(os.environ.get('PORT', 8050))
     print(f"🚀 Starting server on port {port}")
-    app.run(debug=False, host='0.0.0.0', port=port) 
+    app.run(debug=False, host='0.0.0.0', port=port)
+
 
