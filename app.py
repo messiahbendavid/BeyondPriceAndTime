@@ -2419,52 +2419,169 @@ def update_table(n, view_mode, type_filter, sym, thresh, stasis, direction, meri
 
 
 # ============================================================================
+# INITIALIZATION
+# ============================================================================
+
+_initialized = False
+_init_lock = threading.Lock()
+
+
+def initialize_app():
+    """
+    Initialize the application with parallel data fetching where possible.
+    This runs in a background thread to allow the server to start quickly.
+    """
+    global _initialized
+    
+    with _init_lock:
+        if _initialized:
+            return
+        
+        print("=" * 70)
+        print("  🎰 BEYOND PRICE AND TIME - JACKPOT EDITION 🎰")
+        print("  Finding the 7-7-7 alignment across all price levels")
+        print("  © 2026 Truth Communications LLC. All Rights Reserved.")
+        print("=" * 70)
+        
+        print(f"\n📊 Total Symbols: {len(config.symbols)}")
+        print(f"   ETFs: {len(config.etf_symbols)}")
+        print(f"   Stocks: {len(config.symbols) - len(config.etf_symbols)}")
+        
+        print(f"\n📏 Threshold Levels ({len(config.thresholds)}):")
+        for t in config.thresholds:
+            print(f"   • {t*100:.4f}%")
+        
+        print(f"\n🎰 Jackpot Tiers:")
+        for tier_name, tier_info in JACKPOT_TIERS.items():
+            print(f"   {tier_info['emoji']} {tier_name}: {tier_info['min_levels']}+ levels @ {tier_info['min_alignment']}% alignment = {tier_info['multiplier']}")
+        
+        # ================================================================
+        # PARALLEL DATA FETCHING
+        # Fetch 52-week data and volume data simultaneously
+        # ================================================================
+        print("\n" + "=" * 70)
+        print("📡 FETCHING MARKET DATA (PARALLEL)")
+        print("=" * 70)
+        
+        week52_result = {}
+        volume_result = {}
+        fetch_errors = []
+        
+        def fetch_52week_thread():
+            nonlocal week52_result
+            try:
+                print("   🔄 Starting 52-week data fetch...")
+                week52_result = fetch_52_week_data()
+                print(f"   ✅ 52-week data complete: {len(week52_result)} symbols")
+            except Exception as e:
+                fetch_errors.append(f"52-week fetch error: {e}")
+                print(f"   ❌ 52-week data error: {e}")
+        
+        def fetch_volume_thread():
+            nonlocal volume_result
+            try:
+                print("   🔄 Starting volume data fetch...")
+                volume_result = fetch_volume_data()
+                print(f"   ✅ Volume data complete: {len(volume_result)} symbols")
+            except Exception as e:
+                fetch_errors.append(f"Volume fetch error: {e}")
+                print(f"   ❌ Volume data error: {e}")
+        
+        # Start parallel fetches
+        t1 = threading.Thread(target=fetch_52week_thread, daemon=True)
+        t2 = threading.Thread(target=fetch_volume_thread, daemon=True)
+        
+        t1.start()
+        t2.start()
+        
+        # Wait for both to complete
+        t1.join()
+        t2.join()
+        
+        # Store results in config
+        config.week52_data = week52_result
+        config.volumes = volume_result
+        
+        if fetch_errors:
+            print(f"\n⚠️ Fetch warnings: {len(fetch_errors)}")
+            for err in fetch_errors:
+                print(f"   - {err}")
+        
+        # ================================================================
+        # BACKFILL HISTORICAL DATA
+        # ================================================================
+        print("\n" + "=" * 70)
+        print("📜 BACKFILLING HISTORICAL DATA")
+        print("=" * 70)
+        
+        manager.backfill()
+        
+        # ================================================================
+        # START REAL-TIME SERVICES
+        # ================================================================
+        print("\n" + "=" * 70)
+        print("🚀 STARTING REAL-TIME SERVICES")
+        print("=" * 70)
+        
+        # Load saved alerts
+        alert_stats = alert_manager.get_stats()
+        print(f"🔔 Loaded Alerts: {alert_stats['active']} active, {alert_stats['triggered']} triggered")
+        
+        # Start price feed
+        price_feed.start()
+        
+        # Start bitstream manager (includes alert checking)
+        manager.start()
+        
+        print("\n" + "=" * 70)
+        print("✅ INITIALIZATION COMPLETE")
+        print("=" * 70)
+        print(f"\n📊 Summary:")
+        print(f"   • Symbols monitored: {len(config.symbols)}")
+        print(f"   • Threshold levels: {len(config.thresholds)}")
+        print(f"   • Total bitstreams: {len(config.symbols) * len(config.thresholds)}")
+        print(f"   • 52-week data: {len(config.week52_data)} symbols")
+        print(f"   • Volume data: {len(config.volumes)} symbols")
+        print(f"   • Active alerts: {alert_stats['active']}")
+        
+        print("\n🎰 JACKPOT EDITION FEATURES:")
+        print("   • Multi-level alignment detection (like 7-7-7 slots)")
+        print("   • Heat map showing signal intensity")
+        print("   • Leaderboard ranking top opportunities")
+        print("   • Achievement badges for special patterns")
+        print("   • Jackpot notifications with celebrations")
+        print("   • Price alerts with real-time monitoring")
+        print("=" * 70 + "\n")
+        
+        _initialized = True
+
+
+# Start initialization in background thread
+_init_thread = threading.Thread(target=initialize_app, daemon=True)
+_init_thread.start()
+
+
+# ============================================================================
 # MAIN
 # ============================================================================
 
 if __name__ == '__main__':
-    print("=" * 70)
-    print("  🎰 BEYOND PRICE AND TIME - JACKPOT EDITION 🎰")
-    print("  Finding the 7-7-7 alignment across all price levels")
-    print("  © 2026 Truth Communications LLC. All Rights Reserved.")
-    print("=" * 70)
+    import os
     
-    print(f"\n📊 Total Symbols: {len(config.symbols)}")
-    print(f"   ETFs: {len(config.etf_symbols)}")
-    print(f"   Stocks: {len(config.symbols) - len(config.etf_symbols)}")
+    # Wait for initialization to complete
+    _init_thread.join()
     
-    print(f"\n📏 Threshold Levels ({len(config.thresholds)}):")
-    for t in config.thresholds:
-        print(f"   • {t*100:.4f}%")
+    print("\n✅ Server starting: http://127.0.0.1:8050")
+    print("🎰 Ready to find jackpots!\n")
     
-    print(f"\n🎰 Jackpot Tiers:")
-    for tier, info in JACKPOT_TIERS.items():
-        print(f"   {info['emoji']} {tier}: {info['min_levels']}+ levels @ {info['min_alignment']}% alignment = {info['multiplier']}")
+    # Auto-open browser after short delay
+    threading.Thread(
+        target=lambda: (time.sleep(2), webbrowser.open('http://127.0.0.1:8050')), 
+        daemon=True
+    ).start()
     
-    print("\n" + "=" * 70)
-    print("📅 FETCHING 52-WEEK DATA")
-    print("=" * 70)
-    config.week52_data = fetch_52_week_data()
+    # Get port from environment (for cloud deployment) or default to 8050
+    port = int(os.environ.get('PORT', 8050))
     
-    print("=" * 70)
-    print("📊 FETCHING VOLUME DATA")
-    print("=" * 70)
-    config.volumes = fetch_volume_data()
-    
-    manager.backfill()
-    
-    price_feed.start()
-    manager.start()
-    
-    print("\n✅ Server: http://127.0.0.1:8050")
-    print("\n🎰 JACKPOT EDITION FEATURES:")
-    print("   • Multi-level alignment detection (like 7-7-7 slots)")
-    print("   • Heat map showing signal intensity")
-    print("   • Leaderboard ranking top opportunities")
-    print("   • Achievement badges for special patterns")
-    print("   • Jackpot notifications with celebrations")
-    print("=" * 70 + "\n")
-    
-    threading.Thread(target=lambda: (time.sleep(2), webbrowser.open('http://127.0.0.1:8050')), daemon=True).start()
-    
-    app.run(debug=False, host='127.0.0.1', port=8050)
+    # Run the Dash server
+    app.run(debug=False, host='0.0.0.0', port=port)
