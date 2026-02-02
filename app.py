@@ -2523,10 +2523,6 @@ def initialize_app():
         print("🚀 STARTING REAL-TIME SERVICES")
         print("=" * 70)
         
-        # Load saved alerts
-        alert_stats = alert_manager.get_stats()
-        print(f"🔔 Loaded Alerts: {alert_stats['active']} active, {alert_stats['triggered']} triggered")
-        
         # Start price feed
         price_feed.start()
         
@@ -2585,3 +2581,4 @@ if __name__ == '__main__':
     
     # Run the Dash server
     app.run(debug=False, host='0.0.0.0', port=port)
+
